@@ -331,20 +331,20 @@ mod tests {
 
     #[test]
     fn partitioned_attention() -> Result<()> {
-        check::<64>(65)?;
-        check::<128>(129)?;
-        check::<64>(513)?;
-        check::<128>(513)
+        check::<64>(65, 2)?;
+        check::<128>(129, 2)?;
+        check::<64>(513, 17)?;
+        check::<128>(513, 33)?;
+        check::<128>(33, 33)
     }
 
-    fn check<const TILE: usize>(tokens: usize) -> Result<()> {
+    fn check<const TILE: usize>(tokens: usize, batch: usize) -> Result<()> {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
         let dim = 256;
         let qh = 4;
         let kvh = 2;
-        let batch = 2;
         let parts = tokens.div_ceil(TILE);
         let cap = parts + 1;
         let q: Vec<f32> = (0..batch * qh * dim)
@@ -426,7 +426,7 @@ mod tests {
             "256-dimension causal online attention",
         )?;
         println!(
-            "GPU 256-dimensional online attention matches f64 across a context partition boundary and two causal queries"
+            "GPU 256-dimensional online attention matches f64 across context partitions and causal query tails"
         );
         let k16 = DeviceBuffer::<u16>::zeroed(&stream, k.len())?;
         let v16 = DeviceBuffer::<u16>::zeroed(&stream, v.len())?;
@@ -472,6 +472,44 @@ mod tests {
             "half-cache partitioned attention",
         )?;
         println!("GPU f16 KV cache and partitioned attention match the independent reference");
+        let mma_parts = tokens.div_ceil(256);
+        let mma_partial = DeviceBuffer::<f32>::zeroed(&stream, batch * qh * mma_parts * 258)?;
+        // SAFETY: full CTAs, matching GQA dimensions, padded query tails, and
+        // exactly one partition slot per query/head/256-token context segment.
+        unsafe {
+            module.flash_mma.flash_mma(
+                &stream,
+                LaunchConfig {
+                    grid_dim: ((batch.div_ceil(16) * qh * mma_parts) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                qh,
+                kvh,
+                tokens,
+                mma_parts,
+                &dq,
+                &k16,
+                &v16,
+                mma_partial.cu_deviceptr() as *mut f32,
+            )?;
+            module.attention.flash_merge::<256>(
+                &stream,
+                LaunchConfig::for_num_elems((batch * qh * 32) as u32),
+                batch * qh,
+                mma_parts,
+                mma_parts,
+                &mma_partial,
+                &dg,
+                out.cu_deviceptr() as *mut f32,
+            )?;
+        }
+        close(
+            &out.to_host_vec(&stream)?,
+            &expected,
+            "Tensor Core causal attention",
+        )?;
+        println!("Tensor Core attention: batch={batch} tokens={tokens} matches independent f64");
         Ok(())
     }
 }

@@ -7,9 +7,13 @@ mod convolution;
 #[cfg(test)]
 mod delta;
 mod delta128;
+mod delta_chunk;
+mod delta_mma;
+mod delta_tiles;
 #[cfg(test)]
 mod flash;
 mod flash_half;
+mod flash_mma;
 pub(super) mod integer;
 pub(crate) mod matrix;
 mod normalization;
@@ -17,6 +21,7 @@ mod packed_prefill;
 mod rotary;
 mod selection;
 mod tensor;
+mod topk;
 mod wide_prefill;
 
 pub struct LoadedModule {
@@ -26,14 +31,17 @@ pub struct LoadedModule {
     pub basic: basic::device::LoadedModule,
     pub normalization: normalization::device::LoadedModule,
     pub selection: selection::device::LoadedModule,
+    pub topk: topk::device::LoadedModule,
     pub convolution: convolution::device::LoadedModule,
     #[cfg(test)]
     pub delta: delta::device::LoadedModule,
     pub delta128: delta128::device::LoadedModule,
+    pub delta_chunk: delta_chunk::device::LoadedModule,
     pub rotary: rotary::device::LoadedModule,
     #[cfg(test)]
     pub flash: flash::device::LoadedModule,
     pub flash_half: flash_half::device::LoadedModule,
+    pub flash_mma: flash_mma::device::LoadedModule,
     pub attention: attention::device::LoadedModule,
     pub integer: integer::device::LoadedModule,
     pub matrix: matrix::device::LoadedModule,
@@ -51,14 +59,17 @@ pub fn load(context: &std::sync::Arc<CudaContext>) -> anyhow::Result<LoadedModul
         basic,
         normalization: normalization::device::from_module(module.clone())?,
         selection: selection::device::from_module(module.clone())?,
+        topk: topk::device::from_module(module.clone())?,
         convolution: convolution::device::from_module(module.clone())?,
         #[cfg(test)]
         delta: delta::device::from_module(module.clone())?,
         delta128: delta128::device::from_module(module.clone())?,
+        delta_chunk: delta_chunk::device::from_module(module.clone())?,
         rotary: rotary::device::from_module(module.clone())?,
         #[cfg(test)]
         flash: flash::device::from_module(module.clone())?,
         flash_half: flash_half::device::from_module(module.clone())?,
+        flash_mma: flash_mma::device::from_module(module.clone())?,
         attention: attention::device::from_module(module.clone())?,
         integer: integer::device::from_module(module.clone())?,
         matrix: matrix::device::from_module(module.clone())?,

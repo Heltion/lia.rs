@@ -1,10 +1,11 @@
 use super::*;
 
-pub(crate) const DENSE_MIN_BATCH: usize = 97;
-pub(crate) const WIDE_MIN_BATCH: usize = 128;
+pub(crate) const MEDIUM_MIN_BATCH: usize = 33;
+pub(crate) const WIDE_MIN_BATCH: usize = 65;
 
 /// # Safety
 /// Buffers must remain live on the stream and output must cover rows * batch.
+/// When reusing, packed_input must already contain this exact immutable input.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn launch_prefill_matrix(
     module: &kernels::LoadedModule,
@@ -15,7 +16,7 @@ pub(crate) unsafe fn launch_prefill_matrix(
     batch: usize,
     weights: &DeviceBuffer<u8>,
     input: &DeviceBuffer<f32>,
-    workspace: &DeviceBuffer<u32>,
+    reuse_input: bool,
     packed_input: &DeviceBuffer<u32>,
     output: *mut f32,
 ) -> anyhow::Result<()> {
@@ -34,115 +35,74 @@ pub(crate) unsafe fn launch_prefill_matrix(
             && rows > 0
             && cols.is_multiple_of(256)
             && (1..=512).contains(&batch)
-            && (!(DENSE_MIN_BATCH..WIDE_MIN_BATCH).contains(&batch)
-                || workspace.len() >= rows * cols / 2)
             && (packed_input.cu_deviceptr() as usize).is_multiple_of(16)
-            && (batch < DENSE_MIN_BATCH || (workspace.cu_deviceptr() as usize).is_multiple_of(16))
             && packed_input.len() >= batch * cols / 2
             && input.len() == batch * cols
             && weights.len() == rows * cols / elements as usize * bytes as usize,
         "prefill matrix shape mismatch"
     );
     // SAFETY: the packed allocation covers every complete activation pair.
-    unsafe {
-        module.tensor.pack_input(
-            stream,
-            LaunchConfig::for_num_elems((input.len() / 2) as u32),
-            input,
-            packed_input.cu_deviceptr() as *mut u32,
-        )?;
-    }
-    if !(DENSE_MIN_BATCH..WIDE_MIN_BATCH).contains(&batch) {
-        let tokens = if batch < DENSE_MIN_BATCH {
-            32
-        } else if batch <= 128 {
-            128
-        } else {
-            256
-        };
-        let config = LaunchConfig {
-            grid_dim: ((rows.div_ceil(64) * batch.div_ceil(tokens)) as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        macro_rules! launch {
-            ($kind:literal, $bytes:literal) => {
-                if batch >= WIDE_MIN_BATCH {
-                    if batch <= 128 {
-                        module.wide_prefill.prefill_wide::<$kind, $bytes, 128>(
-                            stream,
-                            config,
-                            cols,
-                            rows,
-                            batch,
-                            weights,
-                            packed_input,
-                            output,
-                        )?;
-                    } else {
-                        module.wide_prefill.prefill_wide::<$kind, $bytes, 256>(
-                            stream,
-                            config,
-                            cols,
-                            rows,
-                            batch,
-                            weights,
-                            packed_input,
-                            output,
-                        )?;
-                    }
-                } else {
-                    module.packed_prefill.prefill_packed::<$kind, $bytes>(
-                        stream,
-                        config,
-                        cols,
-                        rows,
-                        batch,
-                        weights,
-                        packed_input,
-                        output,
-                    )?
-                }
-            };
-        }
-        // SAFETY: full blocks and complete CTAs; all tails are padded and guarded.
+    if !reuse_input {
         unsafe {
-            match kind {
-                0 => launch!(0, 4),
-                30 => launch!(30, 2),
-                10 => launch!(10, 84),
-                12 => launch!(12, 144),
-                14 => launch!(14, 210),
-                16 => launch!(16, 66),
-                17 => launch!(17, 74),
-                18 => launch!(18, 98),
-                19 => launch!(19, 50),
-                21 => launch!(21, 110),
-                22 => launch!(22, 82),
-                23 => launch!(23, 136),
-                29 => launch!(29, 56),
-                _ => return Err(anyhow!("unsupported packed prefill format")),
-            }
+            module.tensor.pack_input(
+                stream,
+                LaunchConfig::for_num_elems((input.len() / 2) as u32),
+                input,
+                packed_input.cu_deviceptr() as *mut u32,
+            )?;
         }
-        return Ok(());
     }
+    let tokens = if batch >= WIDE_MIN_BATCH {
+        128
+    } else if batch >= MEDIUM_MIN_BATCH {
+        64
+    } else {
+        32
+    };
     let config = LaunchConfig {
-        grid_dim: ((rows.div_ceil(128) * batch.div_ceil(128)) as u32, 1, 1),
+        grid_dim: ((rows.div_ceil(64) * batch.div_ceil(tokens)) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
     macro_rules! launch {
         ($kind:literal, $bytes:literal) => {
-            module.tensor.unpack_matrix::<$kind, $bytes>(
-                stream,
-                LaunchConfig::for_num_elems((rows * cols / 8) as u32),
-                weights,
-                workspace.cu_deviceptr() as *mut u32,
-                rows * cols,
-            )?
+            if batch >= WIDE_MIN_BATCH {
+                module.wide_prefill.prefill_wide::<$kind, $bytes, 128>(
+                    stream,
+                    config,
+                    cols,
+                    rows,
+                    batch,
+                    weights,
+                    packed_input,
+                    output,
+                )?;
+            } else if batch >= MEDIUM_MIN_BATCH {
+                module.wide_prefill.prefill_wide::<$kind, $bytes, 64>(
+                    stream,
+                    config,
+                    cols,
+                    rows,
+                    batch,
+                    weights,
+                    packed_input,
+                    output,
+                )?;
+            } else {
+                module.packed_prefill.prefill_packed::<$kind, $bytes>(
+                    stream,
+                    config,
+                    cols,
+                    rows,
+                    batch,
+                    weights,
+                    packed_input,
+                    output,
+                )?;
+            }
         };
     }
-    // SAFETY: validated complete blocks, full CTAs, padded tail rows and tokens.
+    // SAFETY: complete CTAs, full quantization blocks, guarded row/token tails.
     unsafe {
         match kind {
             0 => launch!(0, 4),
@@ -158,21 +118,8 @@ pub(crate) unsafe fn launch_prefill_matrix(
             22 => launch!(22, 82),
             23 => launch!(23, 136),
             29 => launch!(29, 56),
-            _ => return Err(anyhow!("unsupported prefill matrix format")),
+            _ => return Err(anyhow!("unsupported packed prefill format")),
         }
-    }
-    // SAFETY: same validated matrix and output; unpack completes first on this stream.
-    unsafe {
-        module.tensor.prefill_matrix(
-            stream,
-            config,
-            cols,
-            rows,
-            batch,
-            workspace,
-            packed_input,
-            output,
-        )?;
     }
     Ok(())
 }
@@ -190,13 +137,14 @@ mod tests {
         let module = kernels::load(&context)?;
         let (cols, rows) = (768, 143);
         for batch in [
-            9, 31, 32, 33, 63, 64, 65, 96, 97, 127, 128, 129, 255, 256, 257, 512,
+            9, 31, 32, 33, 63, 64, 65, 66, 96, 97, 127, 128, 129, 255, 256, 257, 512,
         ] {
             let input: Vec<f32> = (0..cols * batch)
                 .map(|i| ((i * 71 % 257) as f32 - 128.0) * 0.003)
                 .collect();
             let packed_input = DeviceBuffer::<u32>::zeroed(&stream, input.len() / 2)?;
             let gpu_input = DeviceBuffer::from_host(&stream, &input)?;
+            let mut reuse_input = false;
             for (kind, size) in [
                 (0, 4),
                 (30, 2),
@@ -253,7 +201,6 @@ mod tests {
                 }
 
                 let gpu_weights = DeviceBuffer::from_host(&stream, &weights)?;
-                let workspace = DeviceBuffer::<u32>::zeroed(&stream, rows * cols / 2)?;
                 let output = DeviceBuffer::<f32>::zeroed(&stream, rows * batch)?;
                 // SAFETY: complete matrices, intentionally partial row/token tiles,
                 // and output covering every final element.
@@ -267,11 +214,12 @@ mod tests {
                         batch,
                         &gpu_weights,
                         &gpu_input,
-                        &workspace,
+                        reuse_input,
                         &packed_input,
                         output.cu_deviceptr() as *mut f32,
                     )?;
                 }
+                reuse_input = true;
                 let actual = output.to_host_vec(&stream)?;
                 for row in 0..rows {
                     let mut decoded = Vec::new();

@@ -48,6 +48,9 @@ struct QuantWork {
     packed: DeviceBuffer<u32>,
     scales: DeviceBuffer<f32>,
 }
+struct SelectionWork {
+    candidates: DeviceBuffer<u64>,
+}
 struct Weight {
     data: DeviceBuffer<u8>,
     floats: Option<DeviceBuffer<f32>>,
@@ -91,8 +94,8 @@ pub struct Engine {
     matrix_threads: usize,
     attention_work: RefCell<Option<DeviceBuffer<f32>>>,
     prefill_input: RefCell<Option<DeviceBuffer<u32>>>,
-    prefill_work: RefCell<Option<DeviceBuffer<u32>>>,
     quant_work: RefCell<BTreeMap<usize, QuantWork>>,
+    sampling_work: RefCell<BTreeMap<usize, SelectionWork>>,
     spec_states: Vec<Option<(DeviceBuffer<f32>, DeviceBuffer<f32>)>>,
     capture: bool,
     max_draft: usize,
@@ -175,5 +178,7 @@ mod forward;
 mod load;
 mod mtp;
 mod operations;
+mod projections;
 mod recurrent;
+mod sampling;
 mod speculation;
