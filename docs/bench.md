@@ -33,7 +33,7 @@ from the servers. Missing measurements are not zero.
 prefill tok/s  = prefill tokens / prefill time
 decode tok/s   = decode tokens / decode time
 combined tok/s = (prefill tokens + decode tokens)
-                 / (preparation time + prefill time + decode time)
+                 / (prefill time + decode time)
 
 preparation ratio = llama.cpp preparation time / lia.rs preparation time
 prefill ratio     = lia.rs prefill tok/s / llama.cpp prefill tok/s
@@ -45,9 +45,9 @@ Report all measurements, three speeds for each implementation, and four ratios.
 Ratios above 1 favor lia.rs. Use combined speed as the primary optimization
 metric; this specification sets no target. Use N/A for undefined rates.
 
-Combined speed excludes tool execution, scoring, and overhead outside the
-measured phases; it is not end-to-end task wall time. Retain token counts so
-differences in generated trajectories and cache reuse remain visible.
+Combined speed excludes preparation, tool execution, scoring, and overhead
+outside prefill and decode; it is not end-to-end task wall time. Retain token
+counts so differences in generated trajectories and cache reuse remain visible.
 
 Report each task separately. For a suite summary, sum times and counts for
 each implementation before calculating speeds and ratios; do not average
