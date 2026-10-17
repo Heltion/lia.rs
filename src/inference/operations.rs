@@ -30,6 +30,14 @@ impl Engine {
         })
     }
     pub(super) fn mm(&self, name: &str, input: &DeviceBuffer<f32>) -> Result<Buffer> {
+        self.mm_prepared(name, input, false)
+    }
+    pub(super) fn mm_prepared(
+        &self,
+        name: &str,
+        input: &DeviceBuffer<f32>,
+        reuse_input: bool,
+    ) -> Result<Buffer> {
         let w = self.weight(name)?;
         if w.shape.len() != 2 || !input.len().is_multiple_of(w.shape[0]) {
             return Err(anyhow!("matrix shape mismatch: {name}"));
@@ -47,22 +55,6 @@ impl Engine {
         // SAFETY: validated matrix layout, matching input and allocated output;
         // every warp has one disjoint output row.
         if batch > 8 {
-            let required =
-                if (crate::gpu::DENSE_MIN_BATCH..crate::gpu::WIDE_MIN_BATCH).contains(&batch) {
-                    rows * cols / 2
-                } else {
-                    1
-                };
-            let mut workspace = self.prefill_work.borrow_mut();
-            if workspace
-                .as_ref()
-                .is_none_or(|buffer| buffer.len() < required)
-            {
-                *workspace = Some(DeviceBuffer::zeroed(&self.stream, required)?);
-            }
-            let workspace = workspace
-                .as_ref()
-                .ok_or_else(|| anyhow!("missing prefill workspace"))?;
             let mut packed = self.prefill_input.borrow_mut();
             if packed
                 .as_ref()
@@ -73,7 +65,8 @@ impl Engine {
             let packed = packed
                 .as_ref()
                 .ok_or_else(|| anyhow!("missing prefill input workspace"))?;
-            // SAFETY: checked matrices and workspace; all uses are on one stream.
+            // SAFETY: checked matrices and workspace on one stream. Reuse is
+            // confined to mm_many's identical immutable input and shared width.
             unsafe {
                 crate::gpu::launch_prefill_matrix(
                     &self.module,
@@ -84,7 +77,7 @@ impl Engine {
                     batch,
                     &w.data,
                     input,
-                    workspace,
+                    reuse_input,
                     packed,
                     output.cu_deviceptr() as *mut f32,
                 )?;
@@ -129,13 +122,15 @@ impl Engine {
             // persistent workspaces, and a disjoint output row per warp. Every
             // use of this workspace is ordered on the same stream.
             unsafe {
-                self.module.integer.quantize_activation(
-                    &self.stream,
-                    LaunchConfig::for_num_elems(input.len() as u32),
-                    input,
-                    work.packed.cu_deviceptr() as *mut u32,
-                    work.scales.cu_deviceptr() as *mut f32,
-                )?;
+                if !reuse_input {
+                    self.module.integer.quantize_activation(
+                        &self.stream,
+                        LaunchConfig::for_num_elems(input.len() as u32),
+                        input,
+                        work.packed.cu_deviceptr() as *mut u32,
+                        work.scales.cu_deviceptr() as *mut f32,
+                    )?;
+                }
                 crate::gpu::launch_int_matmul(
                     &self.module,
                     &self.stream,

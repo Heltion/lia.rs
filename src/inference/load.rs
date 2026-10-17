@@ -131,8 +131,8 @@ impl Engine {
                 .ok_or_else(|| anyhow!("LIA_MM_THREADS must be 64, 128 or 256"))?,
             attention_work: RefCell::new(None),
             prefill_input: RefCell::new(None),
-            prefill_work: RefCell::new(None),
             quant_work: RefCell::new(BTreeMap::new()),
+            sampling_work: RefCell::new(BTreeMap::new()),
             spec_states: Vec::new(),
             capture: false,
             max_draft: std::env::var("LIA_MTP_DRAFT_MAX")

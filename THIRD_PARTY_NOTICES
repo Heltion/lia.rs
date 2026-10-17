@@ -3,6 +3,10 @@ lia.rs is licensed under MIT. Its inference implementation is written in Rust.
 src/codebooks.rs contains GGML IQ quantization codebook constants from llama.cpp:
 https://github.com/ggml-org/llama.cpp
 Reference revision: 1268edac579110aeb1407f7928f53193ed4e28d4
+The chunked recurrent algorithm and BF16 residual matrix-product approach
+were also informed by ggml-cuda/gated-delta-net-mma.cu at that revision.
+The corresponding Rust operators are implemented independently.
+
 MIT License
 
 Copyright (c) 2023-2026 The ggml authors
@@ -33,3 +37,8 @@ Dependency copyright notices and licenses remain with the upstream crates.
 The official Gorilla BFCL evaluator and llama.cpp comparison executable are
 external validation tools. Their code, data, model weights and run artifacts
 are not included in this repository.
+
+Sampling algorithm reference: Yaniv Leviathan, Matan Kalman, and Yossi Matias,
+Fast Inference from Transformers via Speculative Decoding (ICML 2023),
+https://arxiv.org/abs/2211.17192. Sample-and-match verification specializes
+speculative sampling to deterministic draft proposals.

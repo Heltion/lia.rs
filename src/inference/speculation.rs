@@ -37,6 +37,24 @@ impl Engine {
         maximum: usize,
         eos: u32,
     ) -> Result<(Vec<u32>, u32, usize, usize)> {
+        self.speculate_inner(first, maximum, eos, None)
+    }
+    pub fn speculate_sampled(
+        &mut self,
+        first: u32,
+        maximum: usize,
+        eos: u32,
+        sampling: &mut crate::sampling::Sampling,
+    ) -> Result<(Vec<u32>, u32, usize, usize)> {
+        self.speculate_inner(first, maximum, eos, Some(sampling))
+    }
+    fn speculate_inner(
+        &mut self,
+        first: u32,
+        maximum: usize,
+        eos: u32,
+        sampling: Option<&mut crate::sampling::Sampling>,
+    ) -> Result<(Vec<u32>, u32, usize, usize)> {
         if maximum == 0 || first == eos {
             return Err(anyhow!("invalid speculative iteration"));
         }
@@ -63,19 +81,8 @@ impl Engine {
         let verification = self.forward_many_device(&inputs, true);
         self.capture = false;
         let verified = verification?.ok_or_else(|| anyhow!("missing verification logits"))?;
-        let verified = self.greedy(&verified)?;
-        let mut accepted = 0;
-        for (index, proposal) in drafts.iter().enumerate() {
-            if verified[index] != *proposal {
-                break;
-            }
-            accepted += 1;
-            if *proposal == eos {
-                break;
-            }
-        }
+        let (accepted, logits) = self.select_verified(&verified, &drafts, eos, sampling)?;
         let count = 1 + accepted;
-        let logits = verified[accepted];
         if count < inputs.len() {
             for (state, captured) in self.states.iter().zip(&self.spec_states) {
                 if let (State::Recurrent { conv, matrix }, Some((c, m))) = (state, captured) {

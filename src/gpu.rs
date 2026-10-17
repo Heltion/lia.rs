@@ -11,7 +11,7 @@ pub use inspection::kernel_info;
 
 mod tensor;
 pub(crate) use tensor::launch_prefill_matrix;
-pub(crate) use tensor::{DENSE_MIN_BATCH, WIDE_MIN_BATCH};
+pub(crate) use tensor::{MEDIUM_MIN_BATCH, WIDE_MIN_BATCH};
 
 #[cfg(test)]
 mod tests {

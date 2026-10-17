@@ -47,3 +47,63 @@ fn batched_forward_and_native_mtp_match_greedy() -> Result<()> {
     assert!(proposed > 0 && accepted > 0 && accepted < proposed);
     Ok(())
 }
+
+#[test]
+#[ignore = "requires LIA_TEST_MODEL and a CUDA device"]
+fn sampled_native_mtp_matches_single_token_sampling() -> Result<()> {
+    use lia::sampling::Sampling;
+    let path = std::env::var("LIA_TEST_MODEL")?;
+    let mut engine = Engine::load(&path, 64)?;
+    let mut reference = Sampling::new(1.0, 20, 0.95, 42)?;
+    let mut logits = engine.forward(109266)?;
+    let mut expected = Vec::new();
+    for step in 0..8 {
+        let distribution = reference.distribution(
+            logits
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(id, value)| (id as u32, value)),
+        )?;
+        let token = reference.draw(&distribution);
+        expected.push(token);
+        if token == 248046 {
+            break;
+        }
+        if step < 7 {
+            logits = engine.forward(token)?;
+        }
+    }
+    engine.reset()?;
+    engine.forward_many(&[109266], false)?;
+    let mut sampling = Sampling::new(1.0, 20, 0.95, 42)?;
+    let mut first = engine.current_sample(&mut sampling)?;
+    let mut actual = Vec::new();
+    let (mut proposed, mut accepted) = (0, 0);
+    while actual.len() < expected.len() {
+        if first == 248046 {
+            actual.push(first);
+            break;
+        }
+        let (tokens, next, n, a) = engine.speculate_sampled(
+            first,
+            expected.len() - actual.len(),
+            248046,
+            &mut sampling,
+        )?;
+        actual.extend(tokens);
+        first = next;
+        proposed += n;
+        accepted += a;
+        if actual.last() == Some(&248046) {
+            break;
+        }
+    }
+    engine.synchronize()?;
+    assert_eq!(
+        actual, expected,
+        "sample-and-match changed the target random stream"
+    );
+    assert!(proposed > 0 && accepted <= proposed);
+    Ok(())
+}

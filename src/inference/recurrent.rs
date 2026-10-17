@@ -4,10 +4,15 @@ impl Engine {
     pub(super) fn linear_attention(&self, layer: usize, x: &DeviceBuffer<f32>) -> Result<Buffer> {
         let batch = x.len() / 5120;
         let prefix = format!("blk.{layer}");
-        let qkv = self.mm(&format!("{prefix}.attn_qkv.weight"), x)?;
-        let z = self.mm(&format!("{prefix}.attn_gate.weight"), x)?;
-        let alpha = self.mm(&format!("{prefix}.ssm_alpha.weight"), x)?;
-        let beta = self.mm(&format!("{prefix}.ssm_beta.weight"), x)?;
+        let [qkv, z, alpha, beta] = self.mm_many(
+            [
+                &format!("{prefix}.attn_qkv.weight"),
+                &format!("{prefix}.attn_gate.weight"),
+                &format!("{prefix}.ssm_alpha.weight"),
+                &format!("{prefix}.ssm_beta.weight"),
+            ],
+            x,
+        )?;
         let State::Recurrent {
             conv: history,
             matrix,
@@ -60,19 +65,46 @@ impl Engine {
                 decay.cu_deviceptr() as *mut f32,
                 bnorm.cu_deviceptr() as *mut f32,
             )?;
-            self.module.delta128.delta_net_128(
-                &self.stream,
-                LaunchConfig::for_num_elems(6144 * 32),
-                16,
-                48,
-                &qk,
-                &conv,
-                &decay,
-                &bnorm,
-                matrix.cu_deviceptr() as *mut f32,
-                captured.map_or(core::ptr::null_mut(), |(_, m)| m.cu_deviceptr() as *mut f32),
-                core.cu_deviceptr() as *mut f32,
-            )?;
+            macro_rules! delta {
+                ($lanes:literal, $shard:literal) => {
+                    self.module.delta128.delta_net_128::<$lanes, $shard>(
+                        &self.stream,
+                        LaunchConfig::for_num_elems(6144 * $lanes),
+                        16,
+                        48,
+                        &qk,
+                        &conv,
+                        &decay,
+                        &bnorm,
+                        matrix.cu_deviceptr() as *mut f32,
+                        captured
+                            .map_or(core::ptr::null_mut(), |(_, m)| m.cu_deviceptr() as *mut f32),
+                        core.cu_deviceptr() as *mut f32,
+                    )
+                };
+            }
+            if batch > 8 && !self.capture {
+                self.module.delta_chunk.delta_chunk(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: (48 * 4, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    16,
+                    48,
+                    &qk,
+                    &conv,
+                    &decay,
+                    &bnorm,
+                    matrix.cu_deviceptr() as *mut f32,
+                    core.cu_deviceptr() as *mut f32,
+                )?;
+            } else if batch > 8 {
+                delta!(8, 16)?;
+            } else {
+                delta!(32, 4)?;
+            }
         }
         let normalized = self.norm(&format!("{prefix}.ssm_norm.weight"), &core, 128)?;
         let gated = self.silu_mul(&normalized, &z)?;

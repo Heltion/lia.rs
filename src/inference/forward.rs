@@ -30,8 +30,13 @@ impl Engine {
                 &residual,
                 5120,
             )?;
-            let up = self.mm(&format!("blk.{layer}.ffn_up.weight"), &normalized)?;
-            let gate = self.mm(&format!("blk.{layer}.ffn_gate.weight"), &normalized)?;
+            let [up, gate] = self.mm_many(
+                [
+                    &format!("blk.{layer}.ffn_up.weight"),
+                    &format!("blk.{layer}.ffn_gate.weight"),
+                ],
+                &normalized,
+            )?;
             let activated = self.silu_mul(&up, &gate)?;
             let down = self.mm(&format!("blk.{layer}.ffn_down.weight"), &activated)?;
             hidden = self.add(&residual, &down)?;
@@ -87,8 +92,13 @@ impl Engine {
                 &residual,
                 5120,
             )?;
-            let up = self.mm(&format!("blk.{layer}.ffn_up.weight"), &normalized)?;
-            let gate = self.mm(&format!("blk.{layer}.ffn_gate.weight"), &normalized)?;
+            let [up, gate] = self.mm_many(
+                [
+                    &format!("blk.{layer}.ffn_up.weight"),
+                    &format!("blk.{layer}.ffn_gate.weight"),
+                ],
+                &normalized,
+            )?;
             let activated = self.silu_mul(&up, &gate)?;
             let down = self.mm(&format!("blk.{layer}.ffn_down.weight"), &activated)?;
             hidden = self.add(&residual, &down)?;

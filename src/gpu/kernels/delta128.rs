@@ -5,10 +5,10 @@ use cuda_host::cuda_module;
 #[cuda_module]
 pub(crate) mod device {
     use super::*;
-    /// A 128-wide recurrent row has four elements per lane. Keep them live
-    /// across the token batch instead of rereading the matrix for every step.
+    /// Prefill uses four eight-lane groups per warp; short decode batches use
+    /// one 32-lane group. Each unrolled shard owns 128 / LANES state elements.
     #[kernel]
-    pub unsafe fn delta_net_128(
+    pub unsafe fn delta_net_128<const LANES: u32, const SHARD: usize>(
         k_heads: usize,
         v_heads: usize,
         qk: &[f32],
@@ -19,72 +19,91 @@ pub(crate) mod device {
         captured: *mut f32,
         out: *mut f32,
     ) {
-        let tid = thread::index_1d().get();
-        let row = tid / 32;
-        let lane = tid % 32;
+        // SAFETY: callers provide complete 128-wide rows and token batches;
+        // every input/state index fits u32 and the allocations cover these rows.
+        let k_heads = k_heads as u32;
+        let v_heads = v_heads as u32;
+        let batch = decay.len() as u32 / v_heads;
+        let tid = thread::index_1d().get() as u32;
+        let row = tid / LANES;
+        let lane = tid % LANES;
+        let root = tid % 32 - lane;
         let head = row / 128;
         let value = row % 128;
+        // 128 rows per head keep every participating warp complete.
         if head < v_heads {
             let base = row * 128 + lane;
-            let (mut s0, mut s1, mut s2, mut s3) = unsafe {
-                (
-                    *state.add(base),
-                    *state.add(base + 32),
-                    *state.add(base + 64),
-                    *state.add(base + 96),
-                )
-            };
+            let mut shard = [0.0f32; SHARD];
+            let mut j = 0;
+            #[unroll]
+            while j < SHARD {
+                shard[j] = unsafe { *state.add((base + LANES * j as u32) as usize) };
+                j += 1;
+            }
             let mut t = 0;
-            while t < decay.len() / v_heads {
+            while t < batch {
                 let qoff = t * 2 * k_heads * 128 + (head % k_heads) * 128 + lane;
                 let koff = qoff + k_heads * 128;
-                let k0 = qk[koff];
-                let k1 = qk[koff + 32];
-                let k2 = qk[koff + 64];
-                let k3 = qk[koff + 96];
-                let mut dot = s0 * k0 + s1 * k1 + s2 * k2 + s3 * k3;
-                let mut delta = 16;
+                let mut keys = [0.0f32; SHARD];
+                let mut queries = [0.0f32; SHARD];
+                let mut dot = 0.0f32;
+                j = 0;
+                #[unroll]
+                while j < SHARD {
+                    keys[j] = unsafe { *qk.get_unchecked((koff + LANES * j as u32) as usize) };
+                    queries[j] = unsafe { *qk.get_unchecked((qoff + LANES * j as u32) as usize) };
+                    dot += shard[j] * keys[j];
+                    j += 1;
+                }
+                let mut delta = LANES / 2;
                 while delta > 0 {
                     dot += cuda_device::warp::shuffle_down_f32_sync(0xffff_ffff, dot, delta);
                     delta /= 2;
                 }
-                dot = cuda_device::warp::shuffle_f32_sync(0xffff_ffff, dot, 0);
-                let d = decay[t * v_heads + head];
-                let v = conv
-                    [t * (2 * k_heads + v_heads) * 128 + 2 * k_heads * 128 + head * 128 + value];
-                let correction = (v - d * dot) * beta[t * v_heads + head];
-                s0 = d * s0 + k0 * correction;
-                s1 = d * s1 + k1 * correction;
-                s2 = d * s2 + k2 * correction;
-                s3 = d * s3 + k3 * correction;
-                if !captured.is_null() {
-                    unsafe {
-                        let off = t * v_heads * 128 * 128 + base;
-                        *captured.add(off) = s0;
-                        *captured.add(off + 32) = s1;
-                        *captured.add(off + 64) = s2;
-                        *captured.add(off + 96) = s3;
+                dot = cuda_device::warp::shuffle_f32_sync(0xffff_ffff, dot, root);
+                let d = unsafe { *decay.get_unchecked((t * v_heads + head) as usize) };
+                let v = unsafe {
+                    *conv.get_unchecked(
+                        (t * (2 * k_heads + v_heads) * 128 + 2 * k_heads * 128 + head * 128 + value)
+                            as usize,
+                    )
+                };
+                let correction =
+                    (v - d * dot) * unsafe { *beta.get_unchecked((t * v_heads + head) as usize) };
+                let mut result = 0.0f32;
+                j = 0;
+                #[unroll]
+                while j < SHARD {
+                    let s = d * shard[j] + keys[j] * correction;
+                    shard[j] = s;
+                    if !captured.is_null() {
+                        unsafe {
+                            let off = t * v_heads * 128 * 128 + base + LANES * j as u32;
+                            *captured.add(off as usize) = s;
+                        }
                     }
+                    result += s * queries[j];
+                    j += 1;
                 }
-                let mut result =
-                    s0 * qk[qoff] + s1 * qk[qoff + 32] + s2 * qk[qoff + 64] + s3 * qk[qoff + 96];
-                delta = 16;
+                delta = LANES / 2;
                 while delta > 0 {
                     result += cuda_device::warp::shuffle_down_f32_sync(0xffff_ffff, result, delta);
                     delta /= 2;
                 }
                 if lane == 0 {
                     unsafe {
-                        *out.add(t * v_heads * 128 + row) = result / 128.0f32.sqrt();
+                        *out.add((t * v_heads * 128 + row) as usize) = result / 128.0f32.sqrt();
                     }
                 }
                 t += 1;
             }
-            unsafe {
-                *state.add(base) = s0;
-                *state.add(base + 32) = s1;
-                *state.add(base + 64) = s2;
-                *state.add(base + 96) = s3;
+            j = 0;
+            #[unroll]
+            while j < SHARD {
+                unsafe {
+                    *state.add((base + LANES * j as u32) as usize) = shard[j];
+                }
+                j += 1;
             }
         }
     }
@@ -252,38 +271,50 @@ mod tests {
             "captured batched recurrence",
         )?;
         println!("GPU speculative recurrence captures all eight intermediate states correctly");
-        let register_state = DeviceBuffer::from_host(&stream, &initial)?;
-        let register_capture = DeviceBuffer::<f32>::zeroed(&stream, 8 * initial.len())?;
-        // SAFETY: 128-wide rows with four elements per lane and eight complete
-        // token states; this uses the same independent f64 history reference.
-        unsafe {
-            module.delta128.delta_net_128(
-                &stream,
-                LaunchConfig::for_num_elems((vh * dim * 32) as u32),
-                kh,
-                vh,
-                &bq,
-                &bc,
-                &bd,
-                &bb,
-                register_state.cu_deviceptr() as *mut f32,
-                register_capture.cu_deviceptr() as *mut f32,
-                batched_out.cu_deviceptr() as *mut f32,
+        for lanes in [8, 32] {
+            let register_state = DeviceBuffer::from_host(&stream, &initial)?;
+            let register_capture = DeviceBuffer::<f32>::zeroed(&stream, 8 * initial.len())?;
+            // SAFETY: complete 128-wide rows and eight token states. Both
+            // lane layouts must match the same independent f64 history reference.
+            macro_rules! launch {
+                ($lanes:literal, $shard:literal) => {
+                    unsafe {
+                        module.delta128.delta_net_128::<$lanes, $shard>(
+                            &stream,
+                            LaunchConfig::for_num_elems((vh * dim * $lanes) as u32),
+                            kh,
+                            vh,
+                            &bq,
+                            &bc,
+                            &bd,
+                            &bb,
+                            register_state.cu_deviceptr() as *mut f32,
+                            register_capture.cu_deviceptr() as *mut f32,
+                            batched_out.cu_deviceptr() as *mut f32,
+                        )?;
+                    }
+                };
+            }
+            if lanes == 8 {
+                launch!(8, 16);
+            } else {
+                launch!(32, 4);
+            }
+
+            close(
+                &register_capture.to_host_vec(&stream)?,
+                &expected_history,
+                "register-resident recurrent history",
             )?;
+            close(
+                &register_state.to_host_vec(&stream)?,
+                &expected,
+                "register-resident final state",
+            )?;
+            println!(
+                "GPU register-resident recurrence matches every independent f64 intermediate state"
+            );
         }
-        close(
-            &register_capture.to_host_vec(&stream)?,
-            &expected_history,
-            "register-resident recurrent history",
-        )?;
-        close(
-            &register_state.to_host_vec(&stream)?,
-            &expected,
-            "register-resident final state",
-        )?;
-        println!(
-            "GPU register-resident recurrence matches every independent f64 intermediate state"
-        );
 
         Ok(())
     }

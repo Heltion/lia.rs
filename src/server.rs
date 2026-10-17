@@ -13,6 +13,7 @@ struct Session {
     checkpoint: Option<Snapshot>,
 }
 
+mod sampling;
 mod session;
 
 struct Job {
@@ -54,7 +55,7 @@ fn worker(
     while let Some(job) = jobs.blocking_recv() {
         let response = match job.path.as_str() {
             "/health" => Ok(
-                json!({"status":"ok","backend":"lia.rs","thinking":true,"mtp":true,"mtp_max_draft":session.engine.max_draft(),"target_verify_max_batch":session.engine.max_draft()+1,"mtp_state_restore":"captured per-position recurrent states","prefill_batch":512,"prefill_precision":"f16","prefill_small_batch":8,"prefill_tensor_min_tokens":9,"prefill_dense_min_tokens":crate::gpu::DENSE_MIN_BATCH,"prefill_wide_min_tokens":crate::gpu::WIDE_MIN_BATCH,"kv_cache":"f16","activation_quantization":session.engine.integer_enabled(),"matrix_split_k":session.engine.matrix_layout().0,"matrix_row_group":session.engine.matrix_layout().1,"matrix_block_threads":session.engine.matrix_threads(),"attention":"partitioned_online_softmax","attention_tile":128,"attention_decode_tile":64}),
+                json!({"status":"ok","backend":"lia.rs","thinking":true,"mtp":true,"sampling_modes":["greedy","top_k_top_p"],"sampling_top_k_max":20,"mtp_max_draft":session.engine.max_draft(),"target_verify_max_batch":session.engine.max_draft()+1,"mtp_state_restore":"captured per-position recurrent states","prefill_batch":512,"prefill_precision":"f16","prefill_small_batch":8,"prefill_tensor_min_tokens":9,"prefill_medium_min_tokens":crate::gpu::MEDIUM_MIN_BATCH,"prefill_wide_min_tokens":crate::gpu::WIDE_MIN_BATCH,"kv_cache":"f16","activation_quantization":session.engine.integer_enabled(),"matrix_split_k":session.engine.matrix_layout().0,"matrix_row_group":session.engine.matrix_layout().1,"matrix_block_threads":session.engine.matrix_threads(),"attention":"partitioned_online_softmax_with_tensor_core_prefill","attention_tile":256,"attention_tensor_min_batch":16,"attention_small_batch_tile":128,"attention_decode_tile":64}),
             ),
             "/v1/chat/completions" => session.chat(&model, &tokenizer, &job.input),
             "/apply-template" => {

@@ -53,8 +53,10 @@ impl Engine {
         };
         let residual = self.add(&projected, &attention)?;
         let normalized = self.norm("blk.64.post_attention_norm.weight", &residual, 5120)?;
-        let up = self.mm("blk.64.ffn_up.weight", &normalized)?;
-        let gate = self.mm("blk.64.ffn_gate.weight", &normalized)?;
+        let [up, gate] = self.mm_many(
+            ["blk.64.ffn_up.weight", "blk.64.ffn_gate.weight"],
+            &normalized,
+        )?;
         let activated = self.silu_mul(&up, &gate)?;
         let down = self.mm("blk.64.ffn_down.weight", &activated)?;
         let hidden = self.add(&residual, &down)?;

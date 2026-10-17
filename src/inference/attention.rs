@@ -14,16 +14,35 @@ impl Engine {
     ) -> Result<Option<Buffer>> {
         let batch = x.len() / 5120;
         let prefix = format!("blk.{layer}");
-        let qgate = if cache_only {
-            None
+        let (qgate, kraw, v) = if cache_only {
+            let [k, v] = self.mm_many(
+                [
+                    &format!("{prefix}.attn_k.weight"),
+                    &format!("{prefix}.attn_v.weight"),
+                ],
+                x,
+            )?;
+            (None, k, v)
         } else {
-            Some(self.mm(&format!("{prefix}.attn_q.weight"), x)?)
+            let [q, k, v] = self.mm_many(
+                [
+                    &format!("{prefix}.attn_q.weight"),
+                    &format!("{prefix}.attn_k.weight"),
+                    &format!("{prefix}.attn_v.weight"),
+                ],
+                x,
+            )?;
+            (Some(q), k, v)
         };
-        let kraw = self.mm(&format!("{prefix}.attn_k.weight"), x)?;
-        let v = self.mm(&format!("{prefix}.attn_v.weight"), x)?;
         let q = self.zeros(batch * 6144)?;
         let k = self.zeros(batch * 1024)?;
-        let tile = if batch <= 8 { 64 } else { 128 };
+        let tile = if batch <= 8 {
+            64
+        } else if batch < 16 {
+            128
+        } else {
+            256
+        };
         let parts = (position + batch).div_ceil(tile);
         let cap_parts = parts;
         let required = batch * 24 * cap_parts * 258;
@@ -124,7 +143,24 @@ impl Engine {
                     )?;
                 }};
             }
-            if tile == 64 {
+            if batch >= 16 {
+                self.module.flash_mma.flash_mma(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: ((batch.div_ceil(16) * 24 * parts) as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    24,
+                    4,
+                    tokens,
+                    parts,
+                    &q,
+                    kc,
+                    vc,
+                    partial.cu_deviceptr() as *mut f32,
+                )?;
+            } else if tile == 64 {
                 attention!(64);
             } else {
                 attention!(128);

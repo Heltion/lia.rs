@@ -10,14 +10,13 @@ impl Session {
         if request.get("stream").and_then(Json::as_bool) == Some(true) {
             return Err(anyhow!("streaming is not implemented"));
         }
-        if request
-            .get("temperature")
-            .and_then(Json::as_f64)
-            .unwrap_or(0.0)
-            != 0.0
-        {
-            return Err(anyhow!("only greedy temperature=0 sampling is implemented"));
-        }
+        let mut sampling = super::sampling::from_request(request)?;
+        let sampling_info = if let Some(s) = &sampling {
+            let (temperature, top_k, top_p) = s.settings();
+            json!({"temperature":temperature,"top_k":top_k,"top_p":top_p,"seed":request.get("seed").and_then(Json::as_u64).unwrap_or(42),"mtp_verification":"target sampling and greedy-draft matching"})
+        } else {
+            json!({"temperature":0.0,"mtp_verification":"greedy target and draft matching"})
+        };
         let text = crate::chat::render(model, request)?;
         let prompt = tokenizer.encode(&text, true)?;
         if prompt.is_empty() {
@@ -71,7 +70,11 @@ impl Session {
             }
             batch_index += 1;
         }
-        let mut first = self.engine.current_token()?;
+        let mut first = if let Some(sampling) = &mut sampling {
+            self.engine.current_sample(sampling)?
+        } else {
+            self.engine.current_token()?
+        };
         self.checkpoint = Some(self.engine.refresh_snapshot(self.checkpoint.take())?);
         let prompt_ms = start.elapsed().as_secs_f64() * 1000.;
         let start = Instant::now();
@@ -85,9 +88,13 @@ impl Session {
                 stopped = true;
                 break;
             }
-            let (confirmed, next, proposed, matched) =
+            let (confirmed, next, proposed, matched) = if let Some(sampling) = &mut sampling {
                 self.engine
-                    .speculate(first, maximum - generated.len(), eos)?;
+                    .speculate_sampled(first, maximum - generated.len(), eos, sampling)?
+            } else {
+                self.engine
+                    .speculate(first, maximum - generated.len(), eos)?
+            };
             drafts += proposed;
             accepted += matched;
             self.tokens.extend_from_slice(&confirmed);
@@ -124,7 +131,7 @@ impl Session {
         } else {
             "stop"
         };
-        let result = json!({"id":"lia-local","object":"chat.completion","model":"lia.rs","choices":[{"index":0,"message":message,"finish_reason":finish}],"usage":{"prompt_tokens":prompt.len(),"completion_tokens":generated.len(),"total_tokens":prompt.len()+generated.len(),"prompt_tokens_details":{"cached_tokens":cached}},"timings":{"cache_n":cached,"prompt_n":prompt.len()-cached,"prompt_ms":prompt_ms,"predicted_n":generated.len(),"predicted_ms":predicted_ms,"predicted_per_second":generated.len().saturating_sub(1) as f64*1000./predicted_ms,"draft_n":drafts,"draft_n_accepted":accepted,"mtp_mode":"native MTP chain; batched target verification with captured per-position recurrent states","mtp_max_draft":self.engine.max_draft(),"activation_quantization":self.engine.integer_enabled()}});
+        let result = json!({"id":"lia-local","object":"chat.completion","model":"lia.rs","choices":[{"index":0,"message":message,"finish_reason":finish}],"usage":{"prompt_tokens":prompt.len(),"completion_tokens":generated.len(),"total_tokens":prompt.len()+generated.len(),"prompt_tokens_details":{"cached_tokens":cached}},"timings":{"sampling":sampling_info,"cache_n":cached,"prompt_n":prompt.len()-cached,"prompt_ms":prompt_ms,"predicted_n":generated.len(),"predicted_ms":predicted_ms,"predicted_per_second":generated.len().saturating_sub(1) as f64*1000./predicted_ms,"draft_n":drafts,"draft_n_accepted":accepted,"mtp_mode":"native MTP chain; batched target verification with captured per-position recurrent states","mtp_max_draft":self.engine.max_draft(),"activation_quantization":self.engine.integer_enabled()}});
         eprintln!(
             "request complete: prompt_tokens={} generation_tokens={} prompt_seconds={:.3} generation_seconds={:.3}",
             prompt.len(),
