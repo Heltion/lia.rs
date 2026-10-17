@@ -8,6 +8,8 @@
 - Keep the repository genuinely Rust-only for implementation code. Do not manipulate language classification to hide other implementation languages.
 - Keep model weights, official benchmark fixtures, answers, simulator checkouts, run results, logs, temporary files, and secrets outside Git.
 - Follow the scope authorized by the user. A request to inspect or discuss code does not authorize implementation changes.
+- Create pull requests only when explicitly requested by the user.
+- Do not change agreed requirements, acceptance criteria, or validation scope without explicit user authorization.
 
 ## Rust Style and Structure
 
@@ -16,6 +18,8 @@
 - Preserve concrete error types required by trait methods and external callbacks.
 - Aim for approximately 256 lines per file. This is a guideline, not a hard limit.
 - Organize modules by responsibility and data boundaries. Allow modest overruns and keep indivisible data structures intact rather than splitting mechanically by line count.
+- Keep unit tests in an inline `#[cfg(test)] mod tests` within the source file they test. Place integration tests in the repository-root `tests/` directory.
+- Keep test-only validation code out of production builds.
 
 ## Dependencies and Changes
 
