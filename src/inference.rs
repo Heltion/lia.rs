@@ -88,6 +88,7 @@ pub struct Engine {
     integer: bool,
     split_k: usize,
     row_group: usize,
+    matrix_threads: usize,
     attention_work: RefCell<Option<DeviceBuffer<f32>>>,
     prefill_input: RefCell<Option<DeviceBuffer<u32>>>,
     prefill_work: RefCell<Option<DeviceBuffer<u32>>>,

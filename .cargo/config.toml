@@ -1,0 +1,3 @@
+[build]
+# CUDA library and test targets otherwise share backend intermediate filenames.
+jobs = 1

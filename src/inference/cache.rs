@@ -20,6 +20,13 @@ impl Engine {
     pub fn matrix_layout(&self) -> (usize, usize) {
         (self.split_k, self.row_group)
     }
+    pub fn matrix_threads(&self) -> usize {
+        if self.split_k == 4 {
+            128
+        } else {
+            self.matrix_threads
+        }
+    }
     pub fn integer_enabled(&self) -> bool {
         self.integer
     }
