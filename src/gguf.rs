@@ -1,8 +1,9 @@
 //! Independent reader for the little-endian GGUF v2/v3 container.
+use anyhow::Context;
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{self, BufReader, Read, Seek},
+    io::{BufReader, Read, Seek},
     path::Path,
 };
 
@@ -28,26 +29,26 @@ pub struct Model {
     pub tensors: Vec<Tensor>,
     pub data_offset: u64,
 }
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+fn invalid(message: &str) -> anyhow::Error {
+    anyhow::anyhow!("{message}")
 }
 struct Reader {
     inner: BufReader<File>,
     size: u64,
 }
 impl Reader {
-    fn bytes<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+    fn bytes<const N: usize>(&mut self) -> anyhow::Result<[u8; N]> {
         let mut b = [0; N];
         self.inner.read_exact(&mut b)?;
         Ok(b)
     }
-    fn u32(&mut self) -> io::Result<u32> {
+    fn u32(&mut self) -> anyhow::Result<u32> {
         Ok(u32::from_le_bytes(self.bytes()?))
     }
-    fn u64(&mut self) -> io::Result<u64> {
+    fn u64(&mut self) -> anyhow::Result<u64> {
         Ok(u64::from_le_bytes(self.bytes()?))
     }
-    fn string(&mut self) -> io::Result<String> {
+    fn string(&mut self) -> anyhow::Result<String> {
         let len = self.u64()?;
         if len > 64 * 1024 * 1024 || len > self.size.saturating_sub(self.inner.stream_position()?) {
             return Err(invalid("invalid string length"));
@@ -56,7 +57,7 @@ impl Reader {
         self.inner.read_exact(&mut b)?;
         String::from_utf8(b).map_err(|_| invalid("invalid UTF-8"))
     }
-    fn value(&mut self, kind: u32, depth: usize) -> io::Result<Value> {
+    fn value(&mut self, kind: u32, depth: usize) -> anyhow::Result<Value> {
         if depth > 8 {
             return Err(invalid("metadata nesting too deep"));
         }
@@ -94,8 +95,9 @@ impl Reader {
     }
 }
 impl Model {
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = File::open(path)?;
+    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let file = File::open(path.as_ref())
+            .with_context(|| format!("opening GGUF {}", path.as_ref().display()))?;
         let size = file.metadata()?.len();
         let mut r = Reader {
             inner: BufReader::new(file),
@@ -251,55 +253,4 @@ pub fn layout(kind: u32) -> Option<(u64, u64)> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    fn open_bytes(bytes: &[u8]) -> io::Result<Model> {
-        let path = std::env::temp_dir().join(format!(
-            "lia-gguf-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&path, bytes)?;
-        let result = Model::open(&path);
-        std::fs::remove_file(path)?;
-        result
-    }
-    fn tiny() -> Vec<u8> {
-        let mut b = b"GGUF".to_vec();
-        b.extend_from_slice(&3u32.to_le_bytes());
-        b.extend_from_slice(&1u64.to_le_bytes()); // tensor count
-        b.extend_from_slice(&0u64.to_le_bytes()); // metadata count
-        b.extend_from_slice(&1u64.to_le_bytes());
-        b.push(b'x');
-        b.extend_from_slice(&1u32.to_le_bytes());
-        b.extend_from_slice(&1u64.to_le_bytes()); // one f32
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&0u64.to_le_bytes()); // data offset
-        b.resize(64, 0);
-        b.extend_from_slice(&1.25f32.to_le_bytes());
-        b
-    }
-    #[test]
-    fn valid_container_and_truncation() {
-        let b = tiny();
-        let model = open_bytes(&b).unwrap();
-        assert_eq!(model.data_offset, 64);
-        assert_eq!(model.tensors[0].byte_len, 4);
-        for end in 0..b.len() {
-            assert!(
-                open_bytes(&b[..end]).is_err(),
-                "accepted truncation at {end}"
-            );
-        }
-    }
-    #[test]
-    fn rejects_invalid_header_dimension_type_and_extent() {
-        for (offset, replacement) in [(0, b'X'), (4, 1), (33, 0), (45, 255), (49, 32)] {
-            let mut b = tiny();
-            b[offset] = replacement;
-            assert!(open_bytes(&b).is_err(), "accepted invalid byte at {offset}");
-        }
-    }
-}
+mod tests;

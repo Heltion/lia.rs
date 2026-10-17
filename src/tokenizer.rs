@@ -1,5 +1,6 @@
 //! Byte-level BPE, with Qwen 3.5 Unicode pre-tokenization.
 use crate::gguf::{Model, Value};
+use anyhow::anyhow;
 use std::collections::HashMap;
 
 pub struct Tokenizer {
@@ -11,15 +12,15 @@ pub struct Tokenizer {
     special: Vec<(String, u32)>,
 }
 impl Tokenizer {
-    pub fn from_model(model: &Model) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_model(model: &Model) -> anyhow::Result<Self> {
         if !matches!(model.metadata.get("tokenizer.ggml.pre"), Some(Value::String(s)) if s == "qwen35")
         {
-            return Err("unsupported tokenizer pre-tokenization".into());
+            return Err(anyhow!("unsupported tokenizer pre-tokenization"));
         }
-        let array = |key: &str| -> Result<&Vec<Value>, Box<dyn std::error::Error>> {
+        let array = |key: &str| -> anyhow::Result<&Vec<Value>> {
             match model.metadata.get(key) {
                 Some(Value::Array { values, .. }) => Ok(values),
-                _ => Err(format!("missing array {key}").into()),
+                _ => Err(anyhow!("missing array {key}")),
             }
         };
         let mut encode_byte = ['\0'; 256];
@@ -34,7 +35,8 @@ impl Tokenizer {
                 extra += 1;
                 c
             };
-            encode_byte[b as usize] = char::from_u32(code).ok_or("invalid byte map")?;
+            encode_byte[b as usize] =
+                char::from_u32(code).ok_or_else(|| anyhow!("invalid byte map"))?;
         }
         let inverse: HashMap<char, u8> = encode_byte
             .iter()
@@ -44,17 +46,17 @@ impl Tokenizer {
         let tokens = array("tokenizer.ggml.tokens")?;
         let types = array("tokenizer.ggml.token_type")?;
         if tokens.len() != types.len() {
-            return Err("token types length mismatch".into());
+            return Err(anyhow!("token types length mismatch"));
         }
         let mut vocab = HashMap::new();
         let mut pieces = Vec::new();
         let mut special = Vec::new();
         for (id, (token, kind)) in tokens.iter().zip(types).enumerate() {
             let Value::String(token) = token else {
-                return Err("non-string token".into());
+                return Err(anyhow!("non-string token"));
             };
             let Value::Signed(kind) = kind else {
-                return Err("invalid token type".into());
+                return Err(anyhow!("invalid token type"));
             };
             if *kind == 3 || *kind == 4 {
                 special.push((token.clone(), id as u32));
@@ -64,7 +66,12 @@ impl Tokenizer {
             } else {
                 token
                     .chars()
-                    .map(|c| inverse.get(&c).copied().ok_or("invalid byte token"))
+                    .map(|c| {
+                        inverse
+                            .get(&c)
+                            .copied()
+                            .ok_or_else(|| anyhow!("invalid byte token"))
+                    })
                     .collect::<Result<Vec<_>, _>>()?
             };
             vocab.insert(token.clone(), id as u32);
@@ -74,9 +81,11 @@ impl Tokenizer {
         let mut ranks = HashMap::new();
         for (rank, merge) in array("tokenizer.ggml.merges")?.iter().enumerate() {
             let Value::String(merge) = merge else {
-                return Err("non-string merge".into());
+                return Err(anyhow!("non-string merge"));
             };
-            let (a, b) = merge.split_once(' ').ok_or("invalid BPE merge")?;
+            let (a, b) = merge
+                .split_once(' ')
+                .ok_or_else(|| anyhow!("invalid BPE merge"))?;
             ranks.insert((a.to_owned(), b.to_owned()), rank);
         }
         let split = fancy_regex::Regex::new(
@@ -91,11 +100,7 @@ impl Tokenizer {
             special,
         })
     }
-    pub fn encode(
-        &self,
-        text: &str,
-        parse_special: bool,
-    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    pub fn encode(&self, text: &str, parse_special: bool) -> anyhow::Result<Vec<u32>> {
         let mut out = Vec::new();
         let mut offset = 0;
         while offset < text.len() {
@@ -136,7 +141,7 @@ impl Tokenizer {
                         *self
                             .vocab
                             .get(&part)
-                            .ok_or("BPE piece absent from vocabulary")?,
+                            .ok_or_else(|| anyhow!("BPE piece absent from vocabulary"))?,
                     );
                 }
             }
@@ -149,13 +154,13 @@ impl Tokenizer {
         }
         Ok(out)
     }
-    pub fn decode(&self, ids: &[u32]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn decode(&self, ids: &[u32]) -> anyhow::Result<Vec<u8>> {
         let mut out = Vec::new();
         for id in ids {
             out.extend_from_slice(
                 self.pieces
                     .get(*id as usize)
-                    .ok_or("token ID out of range")?,
+                    .ok_or_else(|| anyhow!("token ID out of range"))?,
             );
         }
         Ok(out)

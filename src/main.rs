@@ -1,4 +1,5 @@
 #![feature(f16)]
+use anyhow::anyhow;
 mod chat;
 mod codebooks;
 mod gguf;
@@ -13,21 +14,24 @@ mod quant;
 mod server;
 mod tokenizer;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next();
     #[cfg(feature = "cuda")]
     if command.as_deref() == Some("check-speculation") {
-        let path = args.next().ok_or("missing model path")?;
-        let initial: u32 = args.next().ok_or("missing initial token ID")?.parse()?;
+        let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
+        let initial: u32 = args
+            .next()
+            .ok_or_else(|| anyhow!("missing initial token ID"))?
+            .parse()?;
         let expected: Vec<u32> = args
             .next()
-            .ok_or("missing reference token sequence")?
+            .ok_or_else(|| anyhow!("missing reference token sequence"))?
             .split(',')
             .map(str::parse)
             .collect::<Result<_, _>>()?;
         if args.next().is_some() {
-            return Err("unexpected argument".into());
+            return Err(anyhow!("unexpected argument"));
         }
         let mut engine = inference::Engine::load(&path, 64)?;
         engine.forward(initial)?;
@@ -51,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             start.elapsed().as_secs_f64()
         );
         if actual != expected {
-            return Err("speculative tokens differ from reference".into());
+            return Err(anyhow!("speculative tokens differ from reference"));
         }
         println!(
             "Native MTP proposals, batched verification and recurrent rollback match the supplied greedy reference"
@@ -59,22 +63,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     #[cfg(feature = "cuda")]
+    if command.as_deref() == Some("check-prefill-gpu") {
+        return gpu_checks::prefill_matrix();
+    }
+    #[cfg(feature = "cuda")]
     if command.as_deref() == Some("check-int-gpu") {
         return gpu_checks::integer_matmul();
     }
     #[cfg(feature = "cuda")]
     if command.as_deref() == Some("forward-batch") {
-        let path = args.next().ok_or("missing model path")?;
+        let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
         let tokens: Vec<u32> = args
             .next()
-            .ok_or("missing comma-separated token IDs")?
+            .ok_or_else(|| anyhow!("missing comma-separated token IDs"))?
             .split(',')
             .map(str::parse)
             .collect::<Result<_, _>>()?;
         if args.next().is_some() {
-            return Err("unexpected argument".into());
+            return Err(anyhow!("unexpected argument"));
         }
-        let mut engine = inference::Engine::load(&path, 64)?;
+        let mut engine = inference::Engine::load(&path, tokens.len().max(64))?;
         let start = std::time::Instant::now();
         let logits = engine.forward_many(&tokens, true)?;
         eprintln!(
@@ -87,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .enumerate()
                 .max_by(|a, b| a.1.total_cmp(b.1))
-                .ok_or("empty logits")?;
+                .ok_or_else(|| anyhow!("empty logits"))?;
             println!("position={position} token={token} logit={logit}");
         }
         return Ok(());
@@ -100,31 +108,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if command.as_deref() == Some("kernel-names") {
         println!(
             "IQ4_XS {}",
-            gpu::kernels::matvec_packed_ptx_name::<23, 136, 256>()
+            gpu::kernels::matrix::device::matvec_packed_ptx_name::<23, 136, 256>()
         );
         return Ok(());
     }
     #[cfg(feature = "cuda")]
     if command.as_deref() == Some("serve") {
-        let path = args.next().ok_or("missing model path")?;
+        let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
         let port = args.next().map(|s| s.parse()).transpose()?.unwrap_or(18474);
         let capacity = args.next().map(|s| s.parse()).transpose()?.unwrap_or(16384);
         if args.next().is_some() {
-            return Err("unexpected argument".into());
+            return Err(anyhow!("unexpected argument"));
         }
         return server::run(&path, port, capacity);
     }
     #[cfg(feature = "cuda")]
     if command.as_deref() == Some("forward") {
-        let path = args.next().ok_or("missing model path")?;
+        let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
         let tokens: Vec<u32> = args
             .next()
-            .ok_or("missing comma-separated token IDs")?
+            .ok_or_else(|| anyhow!("missing comma-separated token IDs"))?
             .split(',')
             .map(str::parse)
             .collect::<Result<_, _>>()?;
         if args.next().is_some() {
-            return Err("unexpected argument".into());
+            return Err(anyhow!("unexpected argument"));
         }
         let start = std::time::Instant::now();
         let mut engine = inference::Engine::load(&path, 64)?;
@@ -144,7 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .enumerate()
                 .max_by(|a, b| a.1.total_cmp(b.1))
-                .ok_or("empty draft logits")?
+                .ok_or_else(|| anyhow!("empty draft logits"))?
                 .0;
             eprintln!("position={position} mtp_input={next} mtp_draft={draft_next}");
             println!("position={position}");
@@ -156,9 +164,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     #[cfg(feature = "cuda")]
     if command.as_deref() == Some("check-model-gpu") {
-        let path = args.next().ok_or("missing model path")?;
+        let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
         if args.next().is_some() {
-            return Err("unexpected argument".into());
+            return Err(anyhow!("unexpected argument"));
         }
         return gpu::check_model(&path);
     }
@@ -171,9 +179,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if command.as_deref() == Some("render") {
         use std::io::Read;
-        let path = args.next().ok_or("missing model path")?;
+        let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
         if args.next().is_some() {
-            return Err("unexpected argument".into());
+            return Err(anyhow!("unexpected argument"));
         }
         let model = gguf::Model::open(path)?;
         let mut input = String::new();
@@ -186,9 +194,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if command.as_deref() == Some("decode-block") {
         use std::io::{Read, Write};
-        let kind: u32 = args.next().ok_or("missing storage type")?.parse()?;
+        let kind: u32 = args
+            .next()
+            .ok_or_else(|| anyhow!("missing storage type"))?
+            .parse()?;
         if args.next().is_some() {
-            return Err("unexpected argument".into());
+            return Err(anyhow!("unexpected argument"));
         }
         let mut bytes = Vec::new();
         std::io::stdin().take(1024).read_to_end(&mut bytes)?;
@@ -200,26 +211,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if command.as_deref() == Some("tokenize") {
-        let path = args.next().ok_or("missing model path")?;
-        let text = args.next().ok_or("missing text")?;
+        let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
+        let text = args.next().ok_or_else(|| anyhow!("missing text"))?;
         if args.next().is_some() {
-            return Err("unexpected argument".into());
+            return Err(anyhow!("unexpected argument"));
         }
         let model = gguf::Model::open(path)?;
         let tokenizer = tokenizer::Tokenizer::from_model(&model)?;
         let ids = tokenizer.encode(&text, true)?;
         if tokenizer.decode(&ids)? != text.as_bytes() {
-            return Err("token round trip failed".into());
+            return Err(anyhow!("token round trip failed"));
         }
         println!("{ids:?}");
         return Ok(());
     }
     if command.as_deref() != Some("inspect") {
-        return Err("usage: lia inspect MODEL.gguf".into());
+        return Err(anyhow!("usage: lia inspect MODEL.gguf"));
     }
-    let path = args.next().ok_or("missing model path")?;
+    let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
     if args.next().is_some() {
-        return Err("unexpected argument".into());
+        return Err(anyhow!("unexpected argument"));
     }
     let model = gguf::Model::open(path)?;
     println!(
