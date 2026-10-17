@@ -26,6 +26,7 @@ https://github.com/NVIDIA/cuda-rust
 ```text
 cargo oxide build --arch sm_120 -- --release --features cuda
 target/release/lia check-gpu
+target/release/lia check-prefill-gpu
 target/release/lia check-model-gpu /path/to/model.gguf
 target/release/lia forward /path/to/model.gguf 109266,3709
 target/release/lia serve /path/to/model.gguf 18474 16384
@@ -46,9 +47,12 @@ serialized and use one conversation cache, with recurrent-state checkpoints
 for prompt changes.
 The model's own GGUF chat template supplies prompts and tool formatting.
 
-The default matrix path uses signed integer dot products with per-group
-activation quantization and paired output rows. `LIA_INT8=0` selects the
-floating-point activation reference path. `LIA_MM_ROWS=1` selects unpaired
+Decode and small batches use signed integer dot products with per-group
+activation quantization and paired output rows. Prefill uses batches of up to
+512 tokens. Batches above eight use Rust Tensor Core kernels with f32
+accumulation: short batches decode packed weights directly into shared tiles,
+while larger batches unpack weights into a reusable f16 workspace. `LIA_INT8=0` selects the
+floating-point activation reference path for decode and small batches. `LIA_MM_ROWS=1` selects unpaired
 integer rows; `LIA_SPLIT_K=4` splits paired rows across four warps (it requires
 `LIA_MM_ROWS=2`, the default). `LIA_PROFILE=1` adds synchronized matrix timing
 diagnostics; disable it for end-to-end measurements.

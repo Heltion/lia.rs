@@ -1,0 +1,113 @@
+use super::*;
+
+impl Engine {
+    pub fn synchronize(&self) -> Result<()> {
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
+    pub fn trim_scratch(&self) {
+        // Keep small decode buffers, but do not retain large prefill tail
+        // allocations indefinitely across conversations with different shapes.
+        self.pool
+            .borrow_mut()
+            .retain(|elements, _| *elements <= 1024 * 1024);
+    }
+
+    pub fn max_draft(&self) -> usize {
+        self.max_draft
+    }
+    pub fn matrix_layout(&self) -> (usize, usize) {
+        (self.split_k, self.row_group)
+    }
+    pub fn integer_enabled(&self) -> bool {
+        self.integer
+    }
+    pub fn current_token(&self) -> Result<u32> {
+        let hidden = self
+            .last_hidden
+            .as_ref()
+            .ok_or_else(|| anyhow!("no target hidden state"))?;
+        let logits = self.mm("output.weight", hidden)?;
+        Ok(self.greedy(&logits)?[0])
+    }
+    pub(super) fn copy(&self, input: &DeviceBuffer<f32>) -> Result<DeviceBuffer<f32>> {
+        let mut out = DeviceBuffer::zeroed(&self.stream, input.len())?;
+        out.copy_from_device_async(input, &self.stream)?;
+        Ok(out)
+    }
+    pub fn refresh_snapshot(&self, previous: Option<Snapshot>) -> Result<Snapshot> {
+        let Some(mut saved) = previous else {
+            return self.snapshot();
+        };
+        for (state, dest) in self.states.iter().zip(&mut saved.recurrent) {
+            if let (State::Recurrent { conv, matrix }, Some((dc, dm))) = (state, dest) {
+                dc.copy_from_device_async(conv, &self.stream)?;
+                dm.copy_from_device_async(matrix, &self.stream)?;
+            }
+        }
+        match (&self.last_hidden, &mut saved.hidden) {
+            (Some(source), Some(dest)) => dest.copy_from_device_async(source, &self.stream)?,
+            (Some(source), None) => saved.hidden = Some(self.copy(source)?),
+            (None, _) => saved.hidden = None,
+        }
+        saved.position = self.position;
+        self.stream.synchronize()?;
+        Ok(saved)
+    }
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        let mut recurrent = Vec::new();
+        for state in &self.states {
+            recurrent.push(match state {
+                State::Recurrent { conv, matrix } => Some((self.copy(conv)?, self.copy(matrix)?)),
+                State::Attention { .. } => None,
+            });
+        }
+        let hidden = match &self.last_hidden {
+            Some(h) => Some(self.copy(h)?),
+            None => None,
+        };
+        self.stream.synchronize()?;
+        Ok(Snapshot {
+            position: self.position,
+            recurrent,
+            hidden,
+        })
+    }
+    pub fn restore(&mut self, snapshot: &Snapshot) -> Result<()> {
+        for (state, saved) in self.states.iter_mut().zip(&snapshot.recurrent) {
+            if let (State::Recurrent { conv, matrix }, Some((sc, sm))) = (state, saved) {
+                conv.copy_from_device_async(sc, &self.stream)?;
+                matrix.copy_from_device_async(sm, &self.stream)?;
+            }
+        }
+        self.last_hidden = match &snapshot.hidden {
+            Some(h) => {
+                let mut out = self.zeros(h.len())?;
+                out.copy_from_device_async(h, &self.stream)?;
+                Some(out)
+            }
+            None => None,
+        };
+        self.position = snapshot.position;
+        self.mtp_prepared = None;
+        self.stream.synchronize()?;
+        Ok(())
+    }
+    pub fn reset(&mut self) -> Result<()> {
+        self.stream.synchronize()?;
+        for state in &mut self.states {
+            match state {
+                State::Recurrent { conv, matrix } => {
+                    *conv = DeviceBuffer::zeroed(&self.stream, conv.len())?;
+                    *matrix = DeviceBuffer::zeroed(&self.stream, matrix.len())?;
+                }
+                State::Attention { .. } => {}
+            }
+        }
+        self.position = 0;
+        self.last_hidden = None;
+        self.mtp_prepared = None;
+        Ok(())
+    }
+}
