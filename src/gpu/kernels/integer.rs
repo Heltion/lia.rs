@@ -39,6 +39,12 @@ pub(crate) mod device {
         }
     }
 
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    struct Words4 {
+        data: [u32; 4],
+    }
+
     #[inline(always)]
     fn int_dot16<const KIND: u32>(
         w0: u32,
@@ -149,10 +155,10 @@ pub(crate) mod device {
                     };
                 if MAX > 0 && batch > 0 {
                     let base = (col) / 4;
-                    let q0 = unsafe { *x.get_unchecked(base as usize) };
-                    let q1 = unsafe { *x.get_unchecked((base + 1) as usize) };
-                    let q2 = unsafe { *x.get_unchecked((base + 2) as usize) };
-                    let q3 = unsafe { *x.get_unchecked((base + 3) as usize) };
+                    // SAFETY: the host validates 16-byte alignment; columns
+                    // and each vector offset cover complete four-word groups.
+                    let [q0, q1, q2, q3] =
+                        unsafe { x.as_ptr().add(base as usize).cast::<Words4>().read().data };
                     let xs = unsafe { *scales.get_unchecked(((col) / 32) as usize) };
                     sum0 += xs
                         * int_dot16::<KIND>(
@@ -167,10 +173,10 @@ pub(crate) mod device {
                 }
                 if MAX > 1 && batch > 1 {
                     let base = (cols + col) / 4;
-                    let q0 = unsafe { *x.get_unchecked(base as usize) };
-                    let q1 = unsafe { *x.get_unchecked((base + 1) as usize) };
-                    let q2 = unsafe { *x.get_unchecked((base + 2) as usize) };
-                    let q3 = unsafe { *x.get_unchecked((base + 3) as usize) };
+                    // SAFETY: the host validates 16-byte alignment; columns
+                    // and each vector offset cover complete four-word groups.
+                    let [q0, q1, q2, q3] =
+                        unsafe { x.as_ptr().add(base as usize).cast::<Words4>().read().data };
                     let xs = unsafe { *scales.get_unchecked(((cols + col) / 32) as usize) };
                     sum1 += xs
                         * int_dot16::<KIND>(
@@ -185,10 +191,10 @@ pub(crate) mod device {
                 }
                 if MAX > 2 && batch > 2 {
                     let base = (2 * cols + col) / 4;
-                    let q0 = unsafe { *x.get_unchecked(base as usize) };
-                    let q1 = unsafe { *x.get_unchecked((base + 1) as usize) };
-                    let q2 = unsafe { *x.get_unchecked((base + 2) as usize) };
-                    let q3 = unsafe { *x.get_unchecked((base + 3) as usize) };
+                    // SAFETY: the host validates 16-byte alignment; columns
+                    // and each vector offset cover complete four-word groups.
+                    let [q0, q1, q2, q3] =
+                        unsafe { x.as_ptr().add(base as usize).cast::<Words4>().read().data };
                     let xs = unsafe { *scales.get_unchecked(((2 * cols + col) / 32) as usize) };
                     sum2 += xs
                         * int_dot16::<KIND>(
@@ -203,10 +209,10 @@ pub(crate) mod device {
                 }
                 if MAX > 3 && batch > 3 {
                     let base = (3 * cols + col) / 4;
-                    let q0 = unsafe { *x.get_unchecked(base as usize) };
-                    let q1 = unsafe { *x.get_unchecked((base + 1) as usize) };
-                    let q2 = unsafe { *x.get_unchecked((base + 2) as usize) };
-                    let q3 = unsafe { *x.get_unchecked((base + 3) as usize) };
+                    // SAFETY: the host validates 16-byte alignment; columns
+                    // and each vector offset cover complete four-word groups.
+                    let [q0, q1, q2, q3] =
+                        unsafe { x.as_ptr().add(base as usize).cast::<Words4>().read().data };
                     let xs = unsafe { *scales.get_unchecked(((3 * cols + col) / 32) as usize) };
                     sum3 += xs
                         * int_dot16::<KIND>(
@@ -221,10 +227,10 @@ pub(crate) mod device {
                 }
                 if MAX > 4 && batch > 4 {
                     let base = (4 * cols + col) / 4;
-                    let q0 = unsafe { *x.get_unchecked(base as usize) };
-                    let q1 = unsafe { *x.get_unchecked((base + 1) as usize) };
-                    let q2 = unsafe { *x.get_unchecked((base + 2) as usize) };
-                    let q3 = unsafe { *x.get_unchecked((base + 3) as usize) };
+                    // SAFETY: the host validates 16-byte alignment; columns
+                    // and each vector offset cover complete four-word groups.
+                    let [q0, q1, q2, q3] =
+                        unsafe { x.as_ptr().add(base as usize).cast::<Words4>().read().data };
                     let xs = unsafe { *scales.get_unchecked(((4 * cols + col) / 32) as usize) };
                     sum4 += xs
                         * int_dot16::<KIND>(
@@ -239,10 +245,10 @@ pub(crate) mod device {
                 }
                 if MAX > 5 && batch > 5 {
                     let base = (5 * cols + col) / 4;
-                    let q0 = unsafe { *x.get_unchecked(base as usize) };
-                    let q1 = unsafe { *x.get_unchecked((base + 1) as usize) };
-                    let q2 = unsafe { *x.get_unchecked((base + 2) as usize) };
-                    let q3 = unsafe { *x.get_unchecked((base + 3) as usize) };
+                    // SAFETY: the host validates 16-byte alignment; columns
+                    // and each vector offset cover complete four-word groups.
+                    let [q0, q1, q2, q3] =
+                        unsafe { x.as_ptr().add(base as usize).cast::<Words4>().read().data };
                     let xs = unsafe { *scales.get_unchecked(((5 * cols + col) / 32) as usize) };
                     sum5 += xs
                         * int_dot16::<KIND>(
@@ -257,10 +263,10 @@ pub(crate) mod device {
                 }
                 if MAX > 6 && batch > 6 {
                     let base = (6 * cols + col) / 4;
-                    let q0 = unsafe { *x.get_unchecked(base as usize) };
-                    let q1 = unsafe { *x.get_unchecked((base + 1) as usize) };
-                    let q2 = unsafe { *x.get_unchecked((base + 2) as usize) };
-                    let q3 = unsafe { *x.get_unchecked((base + 3) as usize) };
+                    // SAFETY: the host validates 16-byte alignment; columns
+                    // and each vector offset cover complete four-word groups.
+                    let [q0, q1, q2, q3] =
+                        unsafe { x.as_ptr().add(base as usize).cast::<Words4>().read().data };
                     let xs = unsafe { *scales.get_unchecked(((6 * cols + col) / 32) as usize) };
                     sum6 += xs
                         * int_dot16::<KIND>(
@@ -275,10 +281,10 @@ pub(crate) mod device {
                 }
                 if MAX > 7 && batch > 7 {
                     let base = (7 * cols + col) / 4;
-                    let q0 = unsafe { *x.get_unchecked(base as usize) };
-                    let q1 = unsafe { *x.get_unchecked((base + 1) as usize) };
-                    let q2 = unsafe { *x.get_unchecked((base + 2) as usize) };
-                    let q3 = unsafe { *x.get_unchecked((base + 3) as usize) };
+                    // SAFETY: the host validates 16-byte alignment; columns
+                    // and each vector offset cover complete four-word groups.
+                    let [q0, q1, q2, q3] =
+                        unsafe { x.as_ptr().add(base as usize).cast::<Words4>().read().data };
                     let xs = unsafe { *scales.get_unchecked(((7 * cols + col) / 32) as usize) };
                     sum7 += xs
                         * int_dot16::<KIND>(

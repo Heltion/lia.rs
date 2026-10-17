@@ -1,75 +1,11 @@
-#![feature(f16)]
 use anyhow::anyhow;
-mod chat;
-mod codebooks;
-mod gguf;
+use lia::{chat, gguf, quant, tokenizer};
 #[cfg(feature = "cuda")]
-mod gpu;
-#[cfg(feature = "cuda")]
-mod gpu_checks;
-#[cfg(feature = "cuda")]
-mod inference;
-mod quant;
-#[cfg(feature = "cuda")]
-mod server;
-mod tokenizer;
+use lia::{gpu, inference, server};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next();
-    #[cfg(feature = "cuda")]
-    if command.as_deref() == Some("check-speculation") {
-        let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
-        let initial: u32 = args
-            .next()
-            .ok_or_else(|| anyhow!("missing initial token ID"))?
-            .parse()?;
-        let expected: Vec<u32> = args
-            .next()
-            .ok_or_else(|| anyhow!("missing reference token sequence"))?
-            .split(',')
-            .map(str::parse)
-            .collect::<Result<_, _>>()?;
-        if args.next().is_some() {
-            return Err(anyhow!("unexpected argument"));
-        }
-        let mut engine = inference::Engine::load(&path, 64)?;
-        engine.forward(initial)?;
-        let mut first = engine.current_token()?;
-        let mut actual = Vec::new();
-        let mut proposed = 0;
-        let mut accepted = 0;
-        let mut rounds = 0;
-        let start = std::time::Instant::now();
-        while actual.len() < expected.len() {
-            let (tokens, next, n, a) =
-                engine.speculate(first, expected.len() - actual.len(), 248046)?;
-            actual.extend(tokens);
-            first = next;
-            proposed += n;
-            accepted += a;
-            rounds += 1;
-        }
-        println!(
-            "tokens={actual:?} proposed={proposed} accepted={accepted} rounds={rounds} seconds={}",
-            start.elapsed().as_secs_f64()
-        );
-        if actual != expected {
-            return Err(anyhow!("speculative tokens differ from reference"));
-        }
-        println!(
-            "Native MTP proposals, batched verification and recurrent rollback match the supplied greedy reference"
-        );
-        return Ok(());
-    }
-    #[cfg(feature = "cuda")]
-    if command.as_deref() == Some("check-prefill-gpu") {
-        return gpu_checks::prefill_matrix();
-    }
-    #[cfg(feature = "cuda")]
-    if command.as_deref() == Some("check-int-gpu") {
-        return gpu_checks::integer_matmul();
-    }
     #[cfg(feature = "cuda")]
     if command.as_deref() == Some("forward-batch") {
         let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
@@ -103,14 +39,6 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "cuda")]
     if command.as_deref() == Some("kernel-info") {
         return gpu::kernel_info();
-    }
-    #[cfg(feature = "cuda")]
-    if command.as_deref() == Some("kernel-names") {
-        println!(
-            "IQ4_XS {}",
-            gpu::kernels::matrix::device::matvec_packed_ptx_name::<23, 136, 256>()
-        );
-        return Ok(());
     }
     #[cfg(feature = "cuda")]
     if command.as_deref() == Some("serve") {
@@ -161,21 +89,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
         return Ok(());
-    }
-    #[cfg(feature = "cuda")]
-    if command.as_deref() == Some("check-model-gpu") {
-        let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
-        if args.next().is_some() {
-            return Err(anyhow!("unexpected argument"));
-        }
-        return gpu::check_model(&path);
-    }
-    #[cfg(feature = "cuda")]
-    if command.as_deref() == Some("check-gpu") {
-        gpu::check()?;
-        gpu_checks::run()?;
-        gpu_checks::long_attention()?;
-        return gpu_checks::cached_rotary();
     }
     if command.as_deref() == Some("render") {
         use std::io::Read;

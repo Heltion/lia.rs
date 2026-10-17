@@ -5,63 +5,6 @@ use cuda_host::cuda_module;
 #[cuda_module]
 pub(crate) mod device {
     use super::*;
-    /// Each warp reduces a disjoint vocabulary partition. Keys use Rust's
-    /// total float order; ties choose the higher token index like Iterator::max.
-    #[kernel]
-    pub unsafe fn argmax_partial(
-        vocab: usize,
-        parts: usize,
-        input: &[f32],
-        values: *mut f32,
-        ids: *mut u32,
-    ) {
-        let tid = thread::index_1d().get();
-        let group = tid / 32;
-        let lane = tid % 32;
-        if group < input.len() / vocab * parts {
-            let token = group / parts;
-            let part = group % parts;
-            let mut best = f32::NEG_INFINITY;
-            let mut best_key = i32::MIN;
-            let mut best_id = 0u32;
-            let mut i = part * 1024 + lane;
-            while i < (part + 1) * 1024 && i < vocab {
-                let value = input[token * vocab + i];
-                let bits = value.to_bits() as i32;
-                let key = bits ^ (((bits >> 31) as u32 >> 1) as i32);
-                if key > best_key || (key == best_key && i as u32 > best_id) {
-                    best = value;
-                    best_key = key;
-                    best_id = i as u32;
-                }
-                i += 32;
-            }
-            let mut delta = 16;
-            while delta > 0 {
-                let other = cuda_device::warp::shuffle_down_f32_sync(0xffff_ffff, best, delta);
-                let other_id = cuda_device::warp::shuffle_down_f32_sync(
-                    0xffff_ffff,
-                    f32::from_bits(best_id),
-                    delta,
-                )
-                .to_bits();
-                let bits = other.to_bits() as i32;
-                let key = bits ^ (((bits >> 31) as u32 >> 1) as i32);
-                if key > best_key || (key == best_key && other_id > best_id) {
-                    best = other;
-                    best_key = key;
-                    best_id = other_id;
-                }
-                delta /= 2;
-            }
-            if lane == 0 {
-                unsafe {
-                    *values.add(group) = best;
-                    *ids.add(group) = best_id;
-                }
-            }
-        }
-    }
 
     /// Copy one already validated position from a speculative state history.
     #[kernel]
@@ -168,43 +111,6 @@ pub(crate) mod device {
             } else {
                 b[t * dim + j - dim]
             };
-        }
-    }
-
-    #[kernel]
-    pub unsafe fn rms_norm(
-        dim: usize,
-        groups: usize,
-        eps: f32,
-        x: &[f32],
-        weight: &[f32],
-        out: *mut f32,
-    ) {
-        let tid = thread::index_1d().get();
-        let group = tid / 32;
-        let lane = tid % 32;
-        if group < groups {
-            let mut sum = 0.0f32;
-            let mut j = lane;
-            while j < dim {
-                let v = x[group * dim + j];
-                sum += v * v;
-                j += 32;
-            }
-            let mut delta = 16;
-            while delta > 0 {
-                sum += cuda_device::warp::shuffle_down_f32_sync(0xffff_ffff, sum, delta);
-                delta /= 2;
-            }
-            sum = cuda_device::warp::shuffle_f32_sync(0xffff_ffff, sum, 0);
-            let scale = 1.0 / (sum / dim as f32 + eps).sqrt();
-            j = lane;
-            while j < dim {
-                unsafe {
-                    *out.add(group * dim + j) = x[group * dim + j] * scale * weight[j];
-                }
-                j += 32;
-            }
         }
     }
 

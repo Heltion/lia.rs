@@ -1,6 +1,8 @@
 //! Rendering the model-provided chat template and parsing its tool-call format.
 use crate::gguf::{Model, Value};
-use anyhow::{Context, Result, anyhow};
+#[cfg(any(feature = "cuda", test))]
+use anyhow::Context;
+use anyhow::{Result, anyhow};
 use serde_json::{Value as Json, json};
 
 struct SpacedJson;

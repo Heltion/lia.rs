@@ -263,3 +263,72 @@ pub(crate) mod device {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::gpu::{kernels, tests::close};
+    use anyhow::Result;
+    use cuda_core::{CudaContext, DeviceBuffer, simt::LaunchConfig};
+    #[test]
+    fn bf16_partition_reduction() -> Result<()> {
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let module = kernels::load(&ctx)?;
+        let (cols, rows, batch) = (544usize, 7usize, 4usize);
+        let parts = cols.div_ceil(256);
+        let bits: Vec<u16> = (0..rows * cols)
+            .map(|i| {
+                (((i % 29) as f32 - 14.0) * 0.03125)
+                    .to_bits()
+                    .wrapping_shr(16) as u16
+            })
+            .collect();
+        let bytes: Vec<u8> = bits.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let x: Vec<f32> = (0..batch * cols)
+            .map(|i| ((i % 37) as f32 - 18.0) * 0.0125)
+            .collect();
+        let dw = DeviceBuffer::from_host(&stream, &bytes)?;
+        let dx = DeviceBuffer::from_host(&stream, &x)?;
+        let partial = DeviceBuffer::<f32>::zeroed(&stream, parts * rows * batch)?;
+        let out = DeviceBuffer::<f32>::zeroed(&stream, rows * batch)?;
+        // SAFETY: complete BF16 matrices, activation rows and partition outputs.
+        unsafe {
+            module.matrix.bf16_partial(
+                &stream,
+                LaunchConfig::for_num_elems((parts * rows * batch * 32) as u32),
+                cols,
+                rows,
+                batch,
+                parts,
+                &dw,
+                &dx,
+                partial.cu_deviceptr() as *mut f32,
+            )?;
+            module.matrix.bf16_merge(
+                &stream,
+                LaunchConfig::for_num_elems((rows * batch * 32) as u32),
+                parts,
+                &partial,
+                out.cu_deviceptr() as *mut f32,
+            )?;
+        }
+        let mut expected = Vec::new();
+        for t in 0..batch {
+            for row in 0..rows {
+                expected.push(
+                    (0..cols)
+                        .map(|col| {
+                            f32::from_bits((bits[row * cols + col] as u32) << 16) as f64
+                                * x[t * cols + col] as f64
+                        })
+                        .sum(),
+                );
+            }
+        }
+        close(&out.to_host_vec(&stream)?, &expected, "split BF16 matrix")?;
+        println!(
+            "GPU split BF16 reduction matches f64 across batches and a partial final partition"
+        );
+        Ok(())
+    }
+}

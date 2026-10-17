@@ -47,7 +47,12 @@ impl Engine {
         // SAFETY: validated matrix layout, matching input and allocated output;
         // every warp has one disjoint output row.
         if batch > 8 {
-            let required = if batch >= 64 { rows * cols / 2 } else { 1 };
+            let required =
+                if (crate::gpu::DENSE_MIN_BATCH..crate::gpu::WIDE_MIN_BATCH).contains(&batch) {
+                    rows * cols / 2
+                } else {
+                    1
+                };
             let mut workspace = self.prefill_work.borrow_mut();
             if workspace
                 .as_ref()
@@ -140,6 +145,7 @@ impl Engine {
                     batch,
                     self.split_k,
                     self.row_group,
+                    self.matrix_threads,
                     &w.data,
                     &work.packed,
                     &work.scales,
@@ -180,16 +186,33 @@ impl Engine {
         let output = self.zeros(input.len())?;
         // SAFETY: complete disjoint groups, with matching normalization weights.
         unsafe {
-            self.module.basic.rms_norm(
-                &self.stream,
-                LaunchConfig::for_num_elems((groups * 32) as u32),
-                dim,
-                groups,
-                self.eps,
-                input,
-                weight,
-                output.cu_deviceptr() as *mut f32,
-            )?;
+            if dim >= 512 {
+                self.module.normalization.rms_norm_block(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: (groups as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    dim,
+                    groups,
+                    self.eps,
+                    input,
+                    weight,
+                    output.cu_deviceptr() as *mut f32,
+                )?;
+            } else {
+                self.module.normalization.rms_norm(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((groups * 32) as u32),
+                    dim,
+                    groups,
+                    self.eps,
+                    input,
+                    weight,
+                    output.cu_deviceptr() as *mut f32,
+                )?;
+            }
         }
         Ok(output)
     }

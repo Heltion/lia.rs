@@ -25,15 +25,20 @@ https://github.com/NVIDIA/cuda-rust
 
 ```text
 cargo oxide build --arch sm_120 -- --release --features cuda
-target/release/lia check-gpu
-target/release/lia check-prefill-gpu
-target/release/lia check-model-gpu /path/to/model.gguf
 target/release/lia forward /path/to/model.gguf 109266,3709
 target/release/lia serve /path/to/model.gguf 18474 16384
 ```
 
 Change the architecture for your GPU. The CUDA feature contains Rust kernels;
 it does not delegate model inference to another engine.
+
+GPU operator unit tests are compiled only for tests. Run them serially on a
+CUDA device; the ignored model tests additionally require an external model:
+
+```text
+cargo oxide test --arch sm_120 -- --release --features cuda --lib -- --test-threads=1
+LIA_TEST_MODEL=/path/to/model.gguf cargo oxide test --arch sm_120 -- --release --features cuda -- --ignored --test-threads=1
+```
 
 Keep model weights, external source checkouts, BFCL fixtures, evaluation
 outputs, logs, profiling data and temporary files outside this repository.
@@ -50,13 +55,25 @@ The model's own GGUF chat template supplies prompts and tool formatting.
 Decode and small batches use signed integer dot products with per-group
 activation quantization and paired output rows. Prefill uses batches of up to
 512 tokens. Batches above eight use Rust Tensor Core kernels with f32
-accumulation: short batches decode packed weights directly into shared tiles,
-while larger batches unpack weights into a reusable f16 workspace. `LIA_INT8=0` selects the
-floating-point activation reference path for decode and small batches. `LIA_MM_ROWS=1` selects unpaired
-integer rows; `LIA_SPLIT_K=4` splits paired rows across four warps (it requires
-`LIA_MM_ROWS=2`, the default). `LIA_PROFILE=1` adds synchronized matrix timing
-diagnostics; disable it for end-to-end measurements.
+accumulation. Short batches decode packed weights into shared tiles; batches
+of at least 128 reuse wide packed tiles across 128 or 256 tokens. Intermediate
+batches use a reusable expanded f16 workspace. `LIA_INT8=0` selects the
+floating-point activation reference path for decode and small batches.
+`LIA_MM_ROWS=1` selects unpaired integer rows; `LIA_SPLIT_K=4` splits paired
+rows across four warps (it requires
+`LIA_MM_ROWS=2`, the default). `LIA_MM_THREADS` selects 64, 128 (default), or
+256 threads for unsplit integer matrix blocks; split blocks use 128.
+`LIA_PROFILE=1` adds synchronized matrix timing diagnostics; disable it for
+end-to-end measurements.
 
 `LIA_MTP_DRAFT_MAX` accepts 1–7 and tunes native MTP chain length (default 3).
 Verification always checks drafts against the target; this setting does not
 disable thinking or native MTP. KV caches use f16 and accumulate in f32.
+
+The CUDA library target uses release builds without LTO. Builds are serialized
+to avoid intermediate-file collisions in the pinned CUDA backend.
+
+Attention uses 32-bit indexing within the validated context and buffer extents.
+Decode partitions contain 64 tokens; prefill partitions contain 128.
+Large RMSNorm rows use cooperative 256-thread blocks with f32 reduction;
+short rows retain warp reductions.

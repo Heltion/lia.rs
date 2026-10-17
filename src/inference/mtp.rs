@@ -107,7 +107,7 @@ impl Engine {
         // SAFETY: one complete warp per disjoint partition, matching partial
         // value and index arrays. Each input row covers the full vocabulary.
         unsafe {
-            self.module.basic.argmax_partial(
+            self.module.selection.argmax_partial(
                 &self.stream,
                 LaunchConfig::for_num_elems((count * 32) as u32),
                 VOCAB,

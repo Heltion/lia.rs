@@ -23,7 +23,8 @@ impl Engine {
         let v = self.mm(&format!("{prefix}.attn_v.weight"), x)?;
         let q = self.zeros(batch * 6144)?;
         let k = self.zeros(batch * 1024)?;
-        let parts = (position + batch).div_ceil(128);
+        let tile = if batch <= 8 { 64 } else { 128 };
+        let parts = (position + batch).div_ceil(tile);
         let cap_parts = parts;
         let required = batch * 24 * cap_parts * 258;
         let mut workspace = self.attention_work.borrow_mut();
@@ -106,19 +107,28 @@ impl Engine {
             if cache_only {
                 return Ok(None);
             }
-            self.module.flash_half.flash_partial_half::<256, 128>(
-                &self.stream,
-                LaunchConfig::for_num_elems((batch * 24 * parts * 32) as u32),
-                24,
-                4,
-                tokens,
-                parts,
-                cap_parts,
-                &q,
-                kc,
-                vc,
-                partial.cu_deviceptr() as *mut f32,
-            )?;
+            macro_rules! attention {
+                ($tile:literal) => {{
+                    self.module.flash_half.flash_partial_half::<256, $tile>(
+                        &self.stream,
+                        LaunchConfig::for_num_elems((batch * 24 * parts * 32) as u32),
+                        24,
+                        4,
+                        tokens,
+                        parts,
+                        cap_parts,
+                        &q,
+                        kc,
+                        vc,
+                        partial.cu_deviceptr() as *mut f32,
+                    )?;
+                }};
+            }
+            if tile == 64 {
+                attention!(64);
+            } else {
+                attention!(128);
+            }
             self.module.attention.flash_merge::<256>(
                 &self.stream,
                 LaunchConfig::for_num_elems((batch * 24 * 32) as u32),

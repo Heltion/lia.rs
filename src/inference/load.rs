@@ -123,6 +123,12 @@ impl Engine {
                 .ok()
                 .filter(|n| *n == 1 || *n == 2)
                 .ok_or_else(|| anyhow!("LIA_MM_ROWS must be 1 or 2"))?,
+            matrix_threads: std::env::var("LIA_MM_THREADS")
+                .unwrap_or_else(|_| "128".into())
+                .parse::<usize>()
+                .ok()
+                .filter(|n| [64, 128, 256].contains(n))
+                .ok_or_else(|| anyhow!("LIA_MM_THREADS must be 64, 128 or 256"))?,
             attention_work: RefCell::new(None),
             prefill_input: RefCell::new(None),
             prefill_work: RefCell::new(None),
