@@ -1,0 +1,11 @@
+/target/
+/.local/
+*.gguf
+*.log
+.env
+*.ll
+*.ptx
+*.cubin
+*.fatbin
+*.jsonl
+*.bin

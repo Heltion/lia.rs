@@ -1,0 +1,25 @@
+[package]
+name = "lia"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Local Inference for Agent in Rust"
+
+[features]
+default = []
+cuda = ["dep:cuda-device", "dep:cuda-host", "dep:cuda-core", "dep:tiny_http"]
+
+[dependencies]
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+minijinja = { version = "2", features = ["json", "builtins", "preserve_order"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+tiny_http = { version = "0.12", optional = true }
+fancy-regex = "0.16"
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust", rev = "e84e5b3d74014fcca36ffcf1b8d603c197cc7c8f", optional = true }
+cuda-host = { git = "https://github.com/NVIDIA/cuda-rust", rev = "e84e5b3d74014fcca36ffcf1b8d603c197cc7c8f", optional = true }
+cuda-core = { git = "https://github.com/NVIDIA/cuda-rust", rev = "e84e5b3d74014fcca36ffcf1b8d603c197cc7c8f", optional = true }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
