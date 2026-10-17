@@ -1,0 +1,35 @@
+lia.rs is licensed under MIT. Its inference implementation is written in Rust.
+
+src/codebooks.rs contains GGML IQ quantization codebook constants from llama.cpp:
+https://github.com/ggml-org/llama.cpp
+Reference revision: 1268edac579110aeb1407f7928f53193ed4e28d4
+MIT License
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+NVIDIA CUDA Rust is used as a compiler/runtime dependency, not an inference
+engine. Its crates are licensed under Apache-2.0:
+https://github.com/NVIDIA/cuda-rust/blob/e84e5b3d74014fcca36ffcf1b8d603c197cc7c8f/LICENSE
+Dependency copyright notices and licenses remain with the upstream crates.
+
+The official Gorilla BFCL evaluator and llama.cpp comparison executable are
+external validation tools. Their code, data, model weights and run artifacts
+are not included in this repository.
