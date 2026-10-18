@@ -85,11 +85,16 @@ impl Engine {
             .borrow()
             .as_ref()
             .map_or(0, |buffer| buffer.len() * 4);
+        let reserve = if self.geometry.mtp {
+            RESERVE
+        } else {
+            128 * 1024 * 1024
+        };
         plan(
             remaining,
             self.prefill_batch,
             self.position,
-            free.saturating_add(pooled).saturating_sub(RESERVE),
+            free.saturating_add(pooled).saturating_sub(reserve),
             workspace,
         )
     }

@@ -3,6 +3,66 @@ use anyhow::Result;
 use lia::inference::Engine;
 
 #[test]
+#[ignore = "requires LIA_TEST_MODEL, CUDA, and LIA_MTP_DRAFT_MAX=0"]
+fn non_speculative_presence_penalty_matches_full_vocabulary_reference() -> Result<()> {
+    use lia::sampling::Sampling;
+    use std::collections::HashSet;
+    let mut engine = Engine::load(&std::env::var("LIA_TEST_MODEL")?, 64)?;
+    assert!(!engine.mtp_enabled());
+    assert_eq!(engine.max_draft(), 0);
+    for strength in [0.0, 1.5] {
+        engine.reset()?;
+        engine.set_presence_penalty(strength)?;
+        let mut logits = engine.forward(109266)?;
+        let mut reference = Sampling::new(1.0, 20, 0.95, 42)?;
+        let mut seen = HashSet::new();
+        let mut expected = Vec::new();
+        for step in 0..8 {
+            let distribution =
+                reference.distribution(logits.iter().enumerate().map(|(id, value)| {
+                    let id = id as u32;
+                    (id, *value - if seen.contains(&id) { strength } else { 0.0 })
+                }))?;
+            let token = reference.draw(&distribution);
+            expected.push(token);
+            seen.insert(token);
+            if token == 248046 {
+                break;
+            }
+            if step < 7 {
+                logits = engine.forward(token)?;
+            }
+        }
+        engine.reset()?;
+        engine.set_presence_penalty(strength)?;
+        engine.forward(109266)?;
+        let mut sampling = Sampling::new(1.0, 20, 0.95, 42)?;
+        let mut first = engine.current_sample(&mut sampling)?;
+        let mut actual = Vec::new();
+        while actual.len() < expected.len() {
+            if first == 248046 {
+                actual.push(first);
+                break;
+            }
+            let (tokens, next, proposed, accepted) = engine.speculate_sampled(
+                first,
+                expected.len() - actual.len(),
+                248046,
+                &mut sampling,
+            )?;
+            assert_eq!((proposed, accepted), (0, 0));
+            actual.extend(tokens);
+            first = next;
+        }
+        assert_eq!(
+            actual, expected,
+            "presence penalty {strength} changed target sampling"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires LIA_TEST_MODEL and a CUDA device"]
 fn batched_forward_and_native_mtp_match_greedy() -> Result<()> {
     let path = std::env::var("LIA_TEST_MODEL")?;

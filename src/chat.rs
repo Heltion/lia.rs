@@ -30,6 +30,10 @@ pub fn render(model: &Model, request: &Json) -> Result<String> {
         Some(Value::String(s)) => s,
         _ => return Err(anyhow!("missing GGUF chat template")),
     };
+    render_template(template, request)
+}
+
+pub fn render_template(template: &str, request: &Json) -> Result<String> {
     let mut env = minijinja::Environment::new();
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_function(

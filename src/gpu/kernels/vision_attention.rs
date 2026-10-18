@@ -71,7 +71,7 @@ mod tests {
         let context = CudaContext::new(0)?;
         let stream = context.default_stream();
         let module = super::super::load(&context)?;
-        for (tokens, scale) in [(1, 1.0), (7, 0.2), (20, 8.0)] {
+        for (tokens, scale) in [(1usize, 1.0), (7, 0.2), (20, 8.0), (65, 0.2)] {
             let qkv: Vec<f32> = (0..tokens * 3456)
                 .map(|i| ((i * 73 % 257) as f32 - 128.0) * scale / 37.0)
                 .collect();
@@ -80,15 +80,33 @@ mod tests {
             // SAFETY: full warps own distinct query/head output rows; QKV has
             // tokens complete rows of three 1152-element vectors.
             unsafe {
-                module.vision_attention.attention(
+                module.vision_flash.tiled_attention(
                     &stream,
-                    LaunchConfig::for_num_elems((tokens * 16 * 32) as u32),
+                    LaunchConfig {
+                        grid_dim: ((tokens.div_ceil(16) * 16) as u32, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
                     tokens,
                     &input,
                     output.cu_deviceptr() as *mut f32,
                 )?;
             }
             let actual = output.to_host_vec(&stream)?;
+            let scalar = DeviceBuffer::<f32>::zeroed(&stream, tokens * 1152)?;
+            // SAFETY: the scalar comparison uses the same complete QKV rows.
+            unsafe {
+                module.vision_attention.attention(
+                    &stream,
+                    LaunchConfig::for_num_elems((tokens * 16 * 32) as u32),
+                    tokens,
+                    &input,
+                    scalar.cu_deviceptr() as *mut f32,
+                )?;
+            }
+            let scalar = scalar.to_host_vec(&stream)?;
+            let mut max_error = 0.0f64;
+            let mut scalar_error = 0.0f64;
             for query in 0..tokens {
                 for head in 0..16 {
                     let scores: Vec<f64> = (0..tokens)
@@ -113,11 +131,14 @@ mod tests {
                             .sum::<f64>()
                             / sum;
                         let value = actual[query * 1152 + head * 72 + d] as f64;
+                        max_error = max_error.max((value - expected).abs());
+                        scalar_error = scalar_error
+                            .max((scalar[query * 1152 + head * 72 + d] as f64 - expected).abs());
                         // The extreme fixture produces logits above 1000;
-                        // f32 dot rounding can move nearly tied softmax scores.
+                        // F32 MMA accumulation order can move nearly tied softmax scores.
                         // Keep a separate absolute bound for that stress case.
                         let tolerance = if scale > 1.0 {
-                            0.004
+                            0.02
                         } else {
                             3e-5 * (1.0 + expected.abs())
                         };
@@ -128,6 +149,9 @@ mod tests {
                     }
                 }
             }
+            println!(
+                "tokens={tokens} scale={scale} tiled_max_abs_error={max_error} scalar_max_abs_error={scalar_error}"
+            );
         }
         Ok(())
     }

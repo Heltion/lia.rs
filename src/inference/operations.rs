@@ -69,7 +69,9 @@ impl Engine {
         let mut output = self.zeros(rows * batch)?;
         // SAFETY: validated matrix layout, matching input and allocated output;
         // every warp has one disjoint output row.
-        if batch >= crate::gpu::WIDE_MIN_BATCH
+        if w.group.is_some() {
+            self.gsq_mm(w, input, reuse_input, &mut output)?;
+        } else if batch >= crate::gpu::WIDE_MIN_BATCH
             && let Some(weight_scale) = w.fp8_scale
         {
             let mut work = self.fp8_work.borrow_mut();

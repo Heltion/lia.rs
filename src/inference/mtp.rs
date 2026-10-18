@@ -6,19 +6,19 @@ impl Engine {
     }
     fn embed_at(&self, token: u32, position: usize) -> Result<Buffer> {
         let emb = self.weight("token_embd.weight")?;
-        if emb.shape != [5120, 248320] || token as usize >= emb.shape[1] {
+        if emb.shape != [self.geometry.hidden, 248320] || token as usize >= emb.shape[1] {
             return Err(anyhow!("invalid vocabulary or token"));
         }
-        let mut hidden = self.zeros(5120)?;
+        let mut hidden = self.zeros(self.geometry.hidden)?;
         // SAFETY: validated vocabulary index and embedding row extent.
         unsafe {
             self.module.basic.embedding(
                 &self.stream,
-                LaunchConfig::for_num_elems(5120),
+                LaunchConfig::for_num_elems(self.geometry.hidden as u32),
                 emb.kind,
                 emb.bytes,
                 emb.block,
-                5120,
+                self.geometry.hidden,
                 token as usize,
                 &emb.data,
                 &mut hidden,
@@ -106,6 +106,8 @@ impl Engine {
         Ok(result)
     }
     pub(super) fn greedy(&self, logits: &DeviceBuffer<f32>) -> Result<Vec<u32>> {
+        let adjusted = self.adjusted_logits(logits)?;
+        let logits = adjusted.as_deref().unwrap_or(logits);
         const VOCAB: usize = 248320;
         if logits.is_empty() || !logits.len().is_multiple_of(VOCAB) {
             return Err(anyhow!("invalid greedy logit shape"));

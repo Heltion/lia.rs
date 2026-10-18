@@ -10,17 +10,17 @@ impl Engine {
         }
         let w = self.weight("token_embd.weight")?;
 
-        let mut out = self.zeros(tokens.len() * 5120)?;
+        let mut out = self.zeros(tokens.len() * self.geometry.hidden)?;
         // SAFETY: validated token indices, row-aligned embedding table and
         // exactly one guarded output per token embedding element.
         unsafe {
             self.module.basic.embedding_many(
                 &self.stream,
-                LaunchConfig::for_num_elems((tokens.len() * 5120) as u32),
+                LaunchConfig::for_num_elems((tokens.len() * self.geometry.hidden) as u32),
                 w.kind,
                 w.bytes,
                 w.block,
-                5120,
+                self.geometry.hidden,
                 &self.token_ids,
                 &w.data,
                 &mut out,
@@ -30,6 +30,9 @@ impl Engine {
         Ok(out)
     }
     pub(super) fn mtp_many(&self, tokens: &[u32], target: &DeviceBuffer<f32>) -> Result<()> {
+        if !self.geometry.mtp {
+            return Ok(());
+        }
         let batch = tokens.len();
         let embedding = self.embed_many(tokens)?;
         let prev: &DeviceBuffer<f32> = self.last_hidden.as_deref().unwrap_or(&self.zero_hidden);

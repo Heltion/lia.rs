@@ -51,6 +51,9 @@ impl Engine {
     pub fn max_draft(&self) -> usize {
         self.max_draft
     }
+    pub fn mtp_enabled(&self) -> bool {
+        self.geometry.mtp
+    }
     pub fn matrix_layout(&self) -> (usize, usize) {
         (self.split_k, self.row_group)
     }
@@ -62,7 +65,16 @@ impl Engine {
         }
     }
     pub fn integer_enabled(&self) -> bool {
-        self.integer
+        self.integer && !self.geometry.moe
+    }
+    pub fn prefill_precision(&self) -> &'static str {
+        if self.geometry.moe {
+            "gsq_w2_w8_mixed_f16_f32_accumulation"
+        } else if self.fp8_prefill() {
+            "mixed_e4m3_f16_f32_accumulation"
+        } else {
+            "f16"
+        }
     }
     pub fn current_token(&self) -> Result<u32> {
         let hidden = self

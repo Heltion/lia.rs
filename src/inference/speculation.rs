@@ -107,6 +107,16 @@ impl Engine {
         if maximum == 0 {
             return Err(anyhow!("context capacity exceeded"));
         }
+        if !self.geometry.mtp {
+            self.step(first, false)?;
+            self.remember_generated(first)?;
+            let next = if let Some(sampling) = sampling {
+                self.current_sample(sampling)?
+            } else {
+                self.current_token()?
+            };
+            return Ok((vec![first], next, 0, 0));
+        }
         self.prepare_speculation_buffers()?;
         let start_position = self.position;
         let stochastic = draft_sampling.is_some();

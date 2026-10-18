@@ -100,13 +100,27 @@ impl Engine {
             let attention = self.zeros(patches * 1152)?;
             // SAFETY: full warps cover exactly 16 noncausal width-72 heads per patch.
             unsafe {
-                self.module.vision_attention.attention(
-                    &self.stream,
-                    LaunchConfig::for_num_elems((patches * 16 * 32) as u32),
-                    patches,
-                    &rotated,
-                    attention.cu_deviceptr() as *mut f32,
-                )?;
+                if patches <= 16 {
+                    self.module.vision_attention.attention(
+                        &self.stream,
+                        LaunchConfig::for_num_elems((patches * 16 * 32) as u32),
+                        patches,
+                        &rotated,
+                        attention.cu_deviceptr() as *mut f32,
+                    )?;
+                } else {
+                    self.module.vision_flash.tiled_attention(
+                        &self.stream,
+                        LaunchConfig {
+                            grid_dim: ((patches.div_ceil(16) * 16) as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        patches,
+                        &rotated,
+                        attention.cu_deviceptr() as *mut f32,
+                    )?;
+                }
             }
             drop(rotated);
             let projected = self.vision_mm(&format!("{p}.attn_out.weight"), &attention, patches)?;

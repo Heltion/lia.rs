@@ -3,7 +3,6 @@ use super::*;
 impl Session {
     pub(super) fn chat(
         &mut self,
-        model: &Model,
         tokenizer: &Tokenizer,
         request: &Json,
         output: Option<&super::stream::Output>,
@@ -13,12 +12,19 @@ impl Session {
             output.delta(json!({"role":"assistant","content":""}));
         }
         let mut sampling = super::sampling::from_request(request)?;
-        let sampling_info = if let Some(s) = &sampling {
+        let presence = super::sampling::presence(request)?;
+        self.engine.set_presence_penalty(presence)?;
+        let mut sampling_info = if let Some(s) = &sampling {
             let (temperature, top_k, top_p) = s.settings();
             json!({"temperature":temperature,"top_k":top_k,"top_p":top_p,"rng":"mt19937","seed":request.get("seed").and_then(Json::as_u64).unwrap_or(42),"mtp_verification":if self.engine.stochastic_mtp() {"stochastic draft rejection and residual sampling"} else {"target sampling and greedy-draft matching"},"draft_top_k":if self.engine.stochastic_mtp(){10}else{1}})
         } else {
             json!({"temperature":0.0,"mtp_verification":"greedy target and draft matching"})
         };
+        sampling_info["presence_penalty"] = json!(presence);
+        if !self.engine.mtp_enabled() {
+            sampling_info["mtp_verification"] = json!("disabled");
+            sampling_info["draft_top_k"] = json!(0);
+        }
         let mut draft_sampling = if self.engine.stochastic_mtp() {
             sampling
                 .as_ref()
@@ -35,7 +41,7 @@ impl Session {
         } else {
             None
         };
-        let prepared = self.prepare_prompt(model, tokenizer, request)?;
+        let prepared = self.prepare_prompt(tokenizer, request)?;
         let prompt = &prepared.tokens;
         if prompt.is_empty() {
             return Err(anyhow!("empty rendered prompt"));
@@ -50,10 +56,10 @@ impl Session {
         if maximum == 0 {
             return Err(anyhow!("max_tokens must be positive"));
         }
-        let eos = match model.metadata.get("tokenizer.ggml.eos_token_id") {
-            Some(Value::Unsigned(x)) => *x as u32,
-            _ => return Err(anyhow!("missing EOS token")),
-        };
+        let eos = *self
+            .eos_tokens
+            .first()
+            .ok_or_else(|| anyhow!("missing EOS token"))?;
         let start = Instant::now();
         self.engine.trim_scratch();
         if prepared.sources != self.image_sources {
@@ -133,7 +139,7 @@ impl Session {
                 !output.is_some_and(|output| output.is_closed()),
                 "stream client disconnected"
             );
-            if first == eos {
+            if self.eos_tokens.contains(&first) {
                 generated.push(first);
                 stopped = true;
                 break;
@@ -202,7 +208,7 @@ impl Session {
         } else {
             "stop"
         };
-        let result = json!({"id":super::stream::completion_id(),"created":super::stream::unix_seconds(),"object":"chat.completion","model":request.get("model").and_then(Json::as_str).unwrap_or("lia.rs"),"choices":[{"index":0,"message":message,"finish_reason":finish}],"usage":{"prompt_tokens":prompt.len(),"completion_tokens":generated.len(),"total_tokens":prompt.len()+generated.len(),"prompt_tokens_details":{"cached_tokens":cached}},"timings":{"sampling":sampling_info,"cache_n":cached,"prefill_batches":prefill_batches,"prompt_n":prompt.len()-cached,"prompt_ms":prompt_ms,"predicted_n":generated.len(),"predicted_ms":predicted_ms,"predicted_per_second":generated.len().saturating_sub(1) as f64*1000./predicted_ms,"draft_n":drafts,"draft_n_accepted":accepted,"mtp_mode":"native MTP chain; batched target verification with captured per-position recurrent states","mtp_max_draft":self.engine.max_draft(),"activation_quantization":self.engine.integer_enabled()}});
+        let result = json!({"id":super::stream::completion_id(),"created":super::stream::unix_seconds(),"object":"chat.completion","model":request.get("model").and_then(Json::as_str).unwrap_or("lia.rs"),"choices":[{"index":0,"message":message,"finish_reason":finish}],"usage":{"prompt_tokens":prompt.len(),"completion_tokens":generated.len(),"total_tokens":prompt.len()+generated.len(),"prompt_tokens_details":{"cached_tokens":cached}},"timings":{"sampling":sampling_info,"cache_n":cached,"prefill_batches":prefill_batches,"prompt_n":prompt.len()-cached,"prompt_ms":prompt_ms,"predicted_n":generated.len(),"predicted_ms":predicted_ms,"predicted_per_second":generated.len().saturating_sub(1) as f64*1000./predicted_ms,"draft_n":drafts,"draft_n_accepted":accepted,"mtp_mode":if self.engine.mtp_enabled(){"native MTP chain; batched target verification with captured per-position recurrent states"}else{"disabled"},"mtp_max_draft":self.engine.max_draft(),"activation_quantization":self.engine.integer_enabled()}});
         eprintln!(
             "request complete: prompt_tokens={} generation_tokens={} prompt_seconds={:.3} generation_seconds={:.3}",
             prompt.len(),

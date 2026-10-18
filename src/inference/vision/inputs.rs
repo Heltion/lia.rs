@@ -47,26 +47,27 @@ impl Engine {
         position: usize,
     ) -> Result<()> {
         anyhow::ensure!(
-            output.len().is_multiple_of(5120),
+            output.len().is_multiple_of(self.geometry.hidden),
             "invalid embedding output shape"
         );
-        let batch = output.len() / 5120;
+        let batch = output.len() / self.geometry.hidden;
         for image in &self.images {
             let begin = position.max(image.start);
-            let end = (position + batch).min(image.start + image.data.len() / 5120);
+            let end = (position + batch).min(image.start + image.data.len() / self.geometry.hidden);
             if begin >= end {
                 continue;
             }
             // SAFETY: intersection bounds are checked in token units; source and
-            // destination are distinct complete 5120-element rows on one stream.
+            // destination are distinct complete self.geometry.hidden-element rows on one stream.
             unsafe {
                 self.module.basic.restore_position(
                     &self.stream,
-                    LaunchConfig::for_num_elems(((end - begin) * 5120) as u32),
-                    (begin - image.start) * 5120,
-                    (end - begin) * 5120,
+                    LaunchConfig::for_num_elems(((end - begin) * self.geometry.hidden) as u32),
+                    (begin - image.start) * self.geometry.hidden,
+                    (end - begin) * self.geometry.hidden,
                     &image.data,
-                    (output.cu_deviceptr() as *mut f32).add((begin - position) * 5120),
+                    (output.cu_deviceptr() as *mut f32)
+                        .add((begin - position) * self.geometry.hidden),
                 )?;
             }
         }
