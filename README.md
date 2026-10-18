@@ -7,7 +7,7 @@ native MTP block.
 
 The target is GGUF Qwen 3.5 hybrid attention/recurrent inference with thinking
 and native MTP, implemented in Rust using NVIDIA CUDA Rust. llama.cpp and the
-official Gorilla BFCL v3 evaluator are external validation references only.
+official Gorilla BFCL v3 and MMMU evaluators are external validation references only.
 
 ## Build and inspect
 
@@ -37,7 +37,7 @@ CUDA device; the ignored model tests additionally require an external model:
 
 ```text
 cargo oxide test --arch sm_120 -- --release --features cuda --lib -- --test-threads=1
-LIA_TEST_MODEL=/path/to/model.gguf cargo oxide test --arch sm_120 -- --release --features cuda -- --ignored --test-threads=1
+LIA_TEST_MODEL=/path/to/model.gguf cargo oxide test --arch sm_120 -- --release --features cuda --test model -- --ignored --test-threads=1
 ```
 
 Keep model weights, external source checkouts, BFCL fixtures, evaluation
@@ -56,6 +56,33 @@ serialized and use one conversation cache, with recurrent-state checkpoints
 for prompt changes.
 The model's own GGUF chat template supplies prompts and tool formatting.
 
+## Image input
+
+Load the matching Qwen vision projector alongside the language model:
+
+```text
+target/release/lia serve /path/to/model.gguf 18474 32768 --mmproj /path/to/mmproj.gguf
+```
+
+Chat Completions accepts interleaved `text` and `image_url` content parts.
+Supply PNG or JPEG images as base64 data URLs in `image_url.url`. The current
+projector supports the 27-layer, width-1152 `qwen3vl_merger` with 5120 output
+features and no deepstack. Image sizing uses 256–1024 visual tokens, with
+dimensions aligned to the spatial merge grid; working-set limits are checked.
+
+Image decoding, bicubic resizing and normalization run on the CPU. Patch
+projection, the vision transformer and the merger run in independently written
+Rust CUDA kernels. Dense vision projections retain BF16 weights and use FP16
+matrix operands with FP32 accumulation; vision attention accumulates in FP32.
+Image features remain on the GPU and feed both target and native MTP prefill.
+Logical spatial rotary positions are separate from sequential KV cache indices.
+Changed image sources invalidate the conversation cache.
+
+CUDA Graph capture also covers the vision network, using the shared scratch
+pool. Image pixel uploads occur before capture and currently allocate their
+device input per image. Full request latency therefore includes CPU image
+processing, upload and vision execution.
+
 Decode and small batches use signed integer dot products with per-group
 activation quantization and paired output rows. Prefill uses batches of up to
 512 tokens by default. `LIA_PREFILL_BATCH` also accepts 1024, 2048, and 4096;
@@ -67,8 +94,8 @@ from batch 65. `LIA_PREFILL_TILE=64` selects the narrower alternative.
 Shared-memory address permutations avoid row padding while preserving each matrix fragment.
 `LIA_PREALLOCATE=1` reserves GPU scratch buffers and attention, activation,
 token, sampling, and verification workspaces before readiness. The prefill limit
-adapts to available memory; requests lease bounded logical slices without growing
-GPU allocations. Unsupported working-set extents fail explicitly.
+adapts to available memory; language-model execution leases bounded logical
+slices without growing GPU allocations. Unsupported working-set extents fail explicitly.
 `LIA_INT8=0` selects the
 floating-point activation reference path for decode and small batches.
 Projection groups share activation preparation for one immutable input, then

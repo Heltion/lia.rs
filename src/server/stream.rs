@@ -102,6 +102,7 @@ pub(super) struct Text {
     pending: Vec<u8>,
     content: bool,
     tools: bool,
+    started: bool,
 }
 
 impl Text {
@@ -130,6 +131,16 @@ impl Text {
                 Err(error) => return Err(error.into()),
             };
             let text = std::str::from_utf8(&self.pending[..valid])?;
+            // Match the non-streamed response parser without trimming whitespace
+            // inside a channel or splitting a Unicode character.
+            if !self.started {
+                let leading = text.len() - text.trim_start().len();
+                if leading > 0 {
+                    self.pending.drain(..leading);
+                    continue;
+                }
+                self.started = !text.is_empty();
+            }
             let marker = if self.content {
                 "<tool_call>"
             } else {
@@ -143,7 +154,7 @@ impl Text {
                         } else {
                             "reasoning_content"
                         },
-                        &text[..position],
+                        text[..position].trim_end(),
                     );
                 }
                 self.pending.drain(..position + marker.len());
@@ -153,6 +164,7 @@ impl Text {
                     return Ok(());
                 }
                 self.content = true;
+                self.started = false;
                 continue;
             }
             // Hold a possible split delimiter and incomplete UTF-8 until the next token.
@@ -164,7 +176,7 @@ impl Text {
                     .find(|&n| text.ends_with(&marker[..n]))
                     .unwrap_or(0)
             };
-            let length = valid - held;
+            let length = text[..valid - held].trim_end().len();
             if length > 0 {
                 emit(
                     if self.content {
@@ -175,6 +187,9 @@ impl Text {
                     &text[..length],
                 );
                 self.pending.drain(..length);
+            }
+            if last {
+                self.pending.clear();
             }
             return Ok(());
         }
@@ -207,6 +222,31 @@ mod tests {
         assert_eq!(reasoning, "思考");
         assert_eq!(content, "answer");
         assert!(text.tools);
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_channel_whitespace_matches_nonstreamed_content() -> Result<()> {
+        for width in [1, 2, 3, 7, 128] {
+            let raw = " \n思考 中\t \n</think>\n\n  B words\n keep indent\t \n";
+            let mut stream = Text::default();
+            let mut reasoning = String::new();
+            let mut content = String::new();
+            let mut emit = |key: &str, value: &str| {
+                if key == "content" {
+                    content.push_str(value);
+                } else {
+                    reasoning.push_str(value);
+                }
+            };
+            for bytes in raw.as_bytes().chunks(width) {
+                stream.consume(bytes, false, &mut emit)?;
+            }
+            stream.consume(&[], true, &mut emit)?;
+            let parsed = crate::chat::parse(raw, &json!([]))?;
+            assert_eq!(content, parsed["content"].as_str().unwrap());
+            assert_eq!(reasoning, parsed["reasoning_content"].as_str().unwrap());
+        }
         Ok(())
     }
 }

@@ -97,6 +97,8 @@ impl Engine {
             (None, None) => {}
         }
         saved.position = self.position;
+        saved.positions = self.rotary.borrow().plan.clone();
+        saved.images = self.images.clone();
         self.stream.synchronize()?;
         Ok(())
     }
@@ -117,6 +119,8 @@ impl Engine {
             position: self.position,
             recurrent,
             hidden,
+            positions: self.rotary.borrow().plan.clone(),
+            images: self.images.clone(),
         })
     }
     pub fn restore(&mut self, snapshot: &Snapshot) -> Result<()> {
@@ -135,6 +139,8 @@ impl Engine {
             None => None,
         };
         self.position = snapshot.position;
+        self.upload_position_plan(snapshot.positions.clone())?;
+        self.images = snapshot.images.clone();
         self.mtp_prepared = None;
         self.stream.synchronize()?;
         Ok(())
@@ -152,6 +158,8 @@ impl Engine {
         }
         self.position = 0;
         self.rotary.borrow_mut().key = None;
+        self.rotary.borrow_mut().plan = None;
+        self.images.clear();
         self.verify_hidden = None;
         self.capture = false;
         self.last_hidden = None;

@@ -7,6 +7,18 @@ impl Engine {
         Self::load_from_model(path, capacity, &model)
     }
     pub fn load_from_model(path: &str, capacity: usize, model: &Model) -> Result<Self> {
+        Self::load_models(path, capacity, model, None)
+    }
+    pub fn load_with_vision(path: &str, capacity: usize, projector: &str) -> Result<Self> {
+        let model = Model::open(path).context("reading model metadata")?;
+        Self::load_models(path, capacity, &model, Some(projector))
+    }
+    fn load_models(
+        path: &str,
+        capacity: usize,
+        model: &Model,
+        projector: Option<&str>,
+    ) -> Result<Self> {
         if capacity == 0 || capacity > 32768 {
             return Err(anyhow!("context capacity must be 1..=32768"));
         }
@@ -36,6 +48,13 @@ impl Engine {
             }
         }
         validate_weights(model)?;
+        anyhow::ensure!(
+            matches!(model.metadata.get("qwen35.rope.dimension_sections"),
+            Some(Value::Array { values, .. }) if values.len()==4 && values.iter().zip([11,11,10,0])
+                .all(|(v,n)| matches!(v,Value::Unsigned(x) if *x==n)
+                    || matches!(v,Value::Signed(x) if *x==n as i64))),
+            "unsupported interleaved rotary sections"
+        );
         let eps = config_f32(model, "qwen35.attention.layer_norm_rms_epsilon")?;
         let rope_base = config_f32(model, "qwen35.rope.freq_base")?;
         if !eps.is_finite() || eps <= 0.0 || !rope_base.is_finite() || rope_base <= 0.0 {
@@ -122,6 +141,8 @@ impl Engine {
         let rotary = RefCell::new(RotaryWork {
             data: DeviceBuffer::zeroed(&stream, crate::gpu::MAX_PREFILL_BATCH * 64)?,
             key: None,
+            positions: DeviceBuffer::zeroed(&stream, capacity * 4)?,
+            plan: None,
         });
         let token_ids = DeviceBuffer::zeroed(&stream, crate::gpu::MAX_PREFILL_BATCH)?;
         let zero_hidden = DeviceBuffer::zeroed(&stream, 5120)?;
@@ -204,6 +225,8 @@ impl Engine {
             },
             verify_hidden: None,
             rotary,
+            vision_eps: None,
+            images: Vec::new(),
         };
         engine.prepare_speculation_buffers()?;
         engine.prepare_small_workspaces()?;
@@ -225,6 +248,9 @@ impl Engine {
                 maxima: DeviceBuffer::zeroed(&engine.stream, elements.div_ceil(1024))?,
                 scales: DeviceBuffer::zeroed(&engine.stream, 2)?,
             });
+        }
+        if let Some(path) = projector {
+            engine.load_vision(path)?;
         }
         engine.prepare_buffers()?;
         Ok(engine)

@@ -12,3 +12,4 @@ pub mod sampling;
 #[cfg(feature = "cuda")]
 pub mod server;
 pub mod tokenizer;
+pub mod vision;

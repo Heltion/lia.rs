@@ -45,10 +45,15 @@ fn main() -> anyhow::Result<()> {
         let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
         let port = args.next().map(|s| s.parse()).transpose()?.unwrap_or(18474);
         let capacity = args.next().map(|s| s.parse()).transpose()?.unwrap_or(16384);
+        let projector = match args.next().as_deref() {
+            None => None,
+            Some("--mmproj") => Some(args.next().ok_or_else(|| anyhow!("missing mmproj path"))?),
+            Some(_) => return Err(anyhow!("expected --mmproj PATH after context capacity")),
+        };
         if args.next().is_some() {
             return Err(anyhow!("unexpected argument"));
         }
-        return server::run(&path, port, capacity);
+        return server::run_with_projector(&path, port, capacity, projector.as_deref());
     }
     #[cfg(feature = "cuda")]
     if command.as_deref() == Some("forward") {

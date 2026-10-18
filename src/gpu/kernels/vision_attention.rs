@@ -1,0 +1,134 @@
+//! Noncausal, online-softmax attention for 16 vision heads of width 72.
+use cuda_device::{kernel, thread};
+use cuda_host::cuda_module;
+
+#[cuda_module]
+pub(crate) mod device {
+    use super::*;
+
+    #[kernel]
+    pub unsafe fn attention(tokens: usize, qkv: &[f32], output: *mut f32) {
+        let tid = thread::index_1d().get();
+        let group = tid / 32;
+        let lane = tid % 32;
+        if group < tokens * 16 {
+            let query = group / 16;
+            let head = group % 16;
+            let base = query * 3456 + head * 72 + lane;
+            let q0 = qkv[base];
+            let q1 = qkv[base + 32];
+            let q2 = if lane < 8 { qkv[base + 64] } else { 0.0 };
+            let mut o0 = 0.0;
+            let mut o1 = 0.0;
+            let mut o2 = 0.0;
+            let mut max = f32::NEG_INFINITY;
+            let mut sum = 0.0;
+            let mut key = 0;
+            while key < tokens {
+                let kb = key * 3456 + 1152 + head * 72 + lane;
+                let mut score = q0 * qkv[kb] + q1 * qkv[kb + 32];
+                if lane < 8 {
+                    score += q2 * qkv[kb + 64];
+                }
+                let mut step = 16;
+                while step > 0 {
+                    score += cuda_device::warp::shuffle_down_f32_sync(0xffff_ffff, score, step);
+                    step /= 2;
+                }
+                score = cuda_device::warp::shuffle_f32_sync(0xffff_ffff, score, 0) / 72.0f32.sqrt();
+                let next = max.max(score);
+                let keep = (max - next).exp();
+                let probability = (score - next).exp();
+                sum = sum * keep + probability;
+                let vb = key * 3456 + 2304 + head * 72 + lane;
+                o0 = o0 * keep + probability * qkv[vb];
+                o1 = o1 * keep + probability * qkv[vb + 32];
+                if lane < 8 {
+                    o2 = o2 * keep + probability * qkv[vb + 64];
+                }
+                max = next;
+                key += 1;
+            }
+            let dst = query * 1152 + head * 72 + lane;
+            unsafe {
+                *output.add(dst) = o0 / sum;
+                *output.add(dst + 32) = o1 / sum;
+                if lane < 8 {
+                    *output.add(dst + 64) = o2 / sum;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use cuda_core::{CudaContext, DeviceBuffer, simt::LaunchConfig};
+
+    #[test]
+    fn all_patches_participate_in_stable_attention() -> Result<()> {
+        let context = CudaContext::new(0)?;
+        let stream = context.default_stream();
+        let module = super::super::load(&context)?;
+        for (tokens, scale) in [(1, 1.0), (7, 0.2), (20, 8.0)] {
+            let qkv: Vec<f32> = (0..tokens * 3456)
+                .map(|i| ((i * 73 % 257) as f32 - 128.0) * scale / 37.0)
+                .collect();
+            let input = DeviceBuffer::from_host(&stream, &qkv)?;
+            let output = DeviceBuffer::<f32>::zeroed(&stream, tokens * 1152)?;
+            // SAFETY: full warps own distinct query/head output rows; QKV has
+            // tokens complete rows of three 1152-element vectors.
+            unsafe {
+                module.vision_attention.attention(
+                    &stream,
+                    LaunchConfig::for_num_elems((tokens * 16 * 32) as u32),
+                    tokens,
+                    &input,
+                    output.cu_deviceptr() as *mut f32,
+                )?;
+            }
+            let actual = output.to_host_vec(&stream)?;
+            for query in 0..tokens {
+                for head in 0..16 {
+                    let scores: Vec<f64> = (0..tokens)
+                        .map(|key| {
+                            (0..72)
+                                .map(|d| {
+                                    qkv[query * 3456 + head * 72 + d] as f64
+                                        * qkv[key * 3456 + 1152 + head * 72 + d] as f64
+                                })
+                                .sum::<f64>()
+                                / 72.0f64.sqrt()
+                        })
+                        .collect();
+                    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let probabilities: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                    let sum: f64 = probabilities.iter().sum();
+                    for d in 0..72 {
+                        let expected: f64 = probabilities
+                            .iter()
+                            .enumerate()
+                            .map(|(key, p)| p * qkv[key * 3456 + 2304 + head * 72 + d] as f64)
+                            .sum::<f64>()
+                            / sum;
+                        let value = actual[query * 1152 + head * 72 + d] as f64;
+                        // The extreme fixture produces logits above 1000;
+                        // f32 dot rounding can move nearly tied softmax scores.
+                        // Keep a separate absolute bound for that stress case.
+                        let tolerance = if scale > 1.0 {
+                            0.004
+                        } else {
+                            3e-5 * (1.0 + expected.abs())
+                        };
+                        assert!(
+                            (value - expected).abs() < tolerance,
+                            "tokens={tokens} query={query} head={head} d={d}: {value} != {expected}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}

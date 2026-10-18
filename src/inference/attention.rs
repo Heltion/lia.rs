@@ -79,15 +79,30 @@ impl Engine {
             // SAFETY: the persistent table holds MAX_PREFILL_BATCH complete 64-dimensional
             // rotations, matching the maximum validated prefill batch.
             unsafe {
-                self.module.rotary.rope_table(
-                    &self.stream,
-                    LaunchConfig::for_num_elems((batch * 32) as u32),
-                    64,
-                    batch,
-                    position,
-                    self.rope_base,
-                    rotary.data.cu_deviceptr() as *mut f32,
-                )?;
+                let launch = LaunchConfig::for_num_elems((batch * 32) as u32);
+                if let Some(plan) = &rotary.plan {
+                    self.module.position_table.table(
+                        &self.stream,
+                        launch,
+                        batch,
+                        position,
+                        plan.len(),
+                        plan.next_text_position(),
+                        self.rope_base,
+                        &rotary.positions,
+                        rotary.data.cu_deviceptr() as *mut f32,
+                    )?;
+                } else {
+                    self.module.rotary.rope_table(
+                        &self.stream,
+                        launch,
+                        64,
+                        batch,
+                        position,
+                        self.rope_base,
+                        rotary.data.cu_deviceptr() as *mut f32,
+                    )?;
+                }
             }
             rotary.key = Some((position, batch));
         }

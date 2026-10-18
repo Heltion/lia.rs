@@ -22,6 +22,8 @@ use buffer::Buffer;
 struct RotaryWork {
     data: DeviceBuffer<f32>,
     key: Option<(usize, usize)>,
+    positions: DeviceBuffer<u32>,
+    plan: Option<crate::vision::PositionPlan>,
 }
 struct Fp8Work {
     weight_tiles: Option<DeviceBuffer<u32>>,
@@ -59,6 +61,8 @@ pub struct Snapshot {
     pub position: usize,
     recurrent: Vec<Option<(DeviceBuffer<f32>, DeviceBuffer<f32>)>>,
     hidden: Option<DeviceBuffer<f32>>,
+    positions: Option<crate::vision::PositionPlan>,
+    images: Vec<Rc<vision::ImageEmbedding>>,
 }
 pub struct Engine {
     _context: Arc<CudaContext>,
@@ -102,6 +106,8 @@ pub struct Engine {
     stochastic_mtp: bool,
     verify_hidden: Option<Buffer>,
     rotary: RefCell<RotaryWork>,
+    vision_eps: Option<f32>,
+    images: Vec<Rc<vision::ImageEmbedding>>,
 }
 fn config_u64(model: &Model, key: &str) -> Result<u64> {
     match model.metadata.get(key) {
@@ -179,8 +185,10 @@ mod forward;
 mod load;
 mod mtp;
 mod operations;
+mod positions;
 mod prefill;
 mod projections;
 mod recurrent;
 mod sampling;
 mod speculation;
+mod vision;
