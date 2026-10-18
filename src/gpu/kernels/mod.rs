@@ -24,13 +24,23 @@ pub(super) mod integer;
 pub(crate) mod matrix;
 mod normalization;
 mod packed_prefill;
+mod position_table;
 mod rotary;
 mod selection;
 mod tensor;
 mod topk;
+mod vision;
+mod vision_attention;
+mod vision_math;
+mod vision_position;
 mod wide_prefill;
 
 pub struct LoadedModule {
+    pub position_table: position_table::device::LoadedModule,
+    pub vision: vision::device::LoadedModule,
+    pub vision_math: vision_math::device::LoadedModule,
+    pub vision_attention: vision_attention::device::LoadedModule,
+    pub vision_position: vision_position::device::LoadedModule,
     #[cfg(test)]
     pub fp8: fp8::device::LoadedModule,
     pub fp8_weights: fp8_weights::device::LoadedModule,
@@ -65,6 +75,11 @@ pub fn load(context: &std::sync::Arc<CudaContext>) -> anyhow::Result<LoadedModul
     let basic = basic::device::load(context)?;
     let module = basic.as_cuda_module().clone();
     Ok(LoadedModule {
+        position_table: position_table::device::from_module(module.clone())?,
+        vision: vision::device::from_module(module.clone())?,
+        vision_math: vision_math::device::from_module(module.clone())?,
+        vision_attention: vision_attention::device::from_module(module.clone())?,
+        vision_position: vision_position::device::from_module(module.clone())?,
         #[cfg(test)]
         fp8: fp8::device::from_module(module.clone())?,
         fp8_weights: fp8_weights::device::from_module(module.clone())?,

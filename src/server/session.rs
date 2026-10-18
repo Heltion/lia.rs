@@ -35,8 +35,8 @@ impl Session {
         } else {
             None
         };
-        let text = crate::chat::render(model, request)?;
-        let prompt = tokenizer.encode(&text, true)?;
+        let prepared = self.prepare_prompt(model, tokenizer, request)?;
+        let prompt = &prepared.tokens;
         if prompt.is_empty() {
             return Err(anyhow!("empty rendered prompt"));
         }
@@ -56,6 +56,10 @@ impl Session {
         };
         let start = Instant::now();
         self.engine.trim_scratch();
+        if prepared.sources != self.image_sources {
+            self.engine.reset()?;
+            self.tokens.clear();
+        }
         let common = prompt
             .iter()
             .zip(&self.tokens)
@@ -70,6 +74,18 @@ impl Session {
                 self.tokens.clear();
             }
         }
+        if self.tokens.is_empty() && !prepared.images.is_empty() {
+            self.engine.prepare_image_inputs(
+                &prepared.images,
+                prepared
+                    .positions
+                    .clone()
+                    .ok_or_else(|| anyhow!("missing image rotary positions"))?,
+            )?;
+        } else {
+            self.engine.set_position_plan(prepared.positions)?;
+        }
+        self.image_sources = prepared.sources;
         let cached = self.tokens.len();
         let mut processed = cached;
         let mut batch_index = 0;

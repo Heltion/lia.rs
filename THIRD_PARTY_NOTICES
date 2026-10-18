@@ -6,6 +6,9 @@ Reference revision: 1268edac579110aeb1407f7928f53193ed4e28d4
 The chunked recurrent algorithm and BF16 residual matrix-product approach
 were also informed by ggml-cuda/gated-delta-net-mma.cu at that revision.
 The corresponding Rust operators are implemented independently.
+The vision layout and image resampling behavior were informed by
+tools/mtmd/models/qwen3vl.cpp and tools/mtmd/mtmd-image.cpp at that revision.
+The Rust preprocessing and vision operators are implemented independently.
 The reference sampling seed streams and stochastic draft rejection behavior
 were informed by common/sampling.cpp and common/speculative.cpp at that
 revision; the Rust sampler and verification implementation are independent.
@@ -37,7 +40,7 @@ engine. Its crates are licensed under Apache-2.0:
 https://github.com/NVIDIA/cuda-rust/blob/e84e5b3d74014fcca36ffcf1b8d603c197cc7c8f/LICENSE
 Dependency copyright notices and licenses remain with the upstream crates.
 
-The official Gorilla BFCL evaluator and llama.cpp comparison executable are
+The official Gorilla BFCL and MMMU evaluators and llama.cpp comparison executable are
 external validation tools. Their code, data, model weights and run artifacts
 are not included in this repository.
 

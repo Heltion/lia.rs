@@ -11,8 +11,11 @@ struct Session {
     engine: Engine,
     tokens: Vec<u32>,
     checkpoint: Snapshot,
+    processor: Option<crate::vision::Processor>,
+    image_sources: Vec<String>,
 }
 
+mod images;
 mod sampling;
 mod session;
 mod stream;
@@ -26,6 +29,7 @@ struct Job {
 
 fn worker(
     path: String,
+    projector: Option<String>,
     capacity: usize,
     ready: std::sync::mpsc::SyncSender<Result<()>>,
     mut jobs: tokio::sync::mpsc::UnboundedReceiver<Job>,
@@ -33,7 +37,15 @@ fn worker(
     let loaded = (|| -> Result<_> {
         let model = Model::open(&path)?;
         let tokenizer = Tokenizer::from_model(&model)?;
-        let engine = Engine::load_from_model(&path, capacity, &model)?;
+        let (engine, processor) = if let Some(projector) = &projector {
+            let vision = Model::open(projector)?;
+            (
+                Engine::load_with_vision(&path, capacity, projector)?,
+                Some(crate::vision::Processor::from_model(&vision, 256, 1024)?),
+            )
+        } else {
+            (Engine::load_from_model(&path, capacity, &model)?, None)
+        };
         let checkpoint = engine.prepare_checkpoint()?;
         Ok((
             model,
@@ -42,6 +54,8 @@ fn worker(
                 engine,
                 tokens: Vec::new(),
                 checkpoint,
+                processor,
+                image_sources: Vec::new(),
             },
         ))
     })();
@@ -154,13 +168,23 @@ async fn handle(
 }
 
 pub fn run(path: &str, port: u16, capacity: usize) -> Result<()> {
+    run_with_projector(path, port, capacity, None)
+}
+
+pub fn run_with_projector(
+    path: &str,
+    port: u16,
+    capacity: usize,
+    projector: Option<&str>,
+) -> Result<()> {
     use anyhow::Context;
     let (jobs, receiver) = tokio::sync::mpsc::unbounded_channel();
     let (ready, loaded) = std::sync::mpsc::sync_channel(1);
     let path = path.to_owned();
+    let projector = projector.map(str::to_owned);
     let thread = std::thread::Builder::new()
         .name("inference".into())
-        .spawn(move || worker(path, capacity, ready, receiver))?;
+        .spawn(move || worker(path, projector, capacity, ready, receiver))?;
     loaded
         .recv()
         .context("waiting for model initialization")??;
