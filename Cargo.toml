@@ -7,7 +7,7 @@ description = "Local Inference for Agent in Rust"
 
 [features]
 default = []
-cuda = ["dep:cuda-device", "dep:cuda-host", "dep:cuda-core", "dep:axum", "dep:tokio"]
+cuda = ["dep:cuda-device", "dep:cuda-host", "dep:cuda-core", "dep:axum", "dep:tokio", "dep:futures-util"]
 
 [dependencies]
 anyhow = "1"
@@ -17,6 +17,7 @@ minijinja = { version = "2", features = ["json", "builtins", "preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"], optional = true }
 tokio = { version = "1", features = ["rt", "net", "sync"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 fancy-regex = "0.16"
 cuda-device = { git = "https://github.com/NVIDIA/cuda-rust", rev = "e84e5b3d74014fcca36ffcf1b8d603c197cc7c8f", optional = true }
 cuda-host = { git = "https://github.com/NVIDIA/cuda-rust", rev = "e84e5b3d74014fcca36ffcf1b8d603c197cc7c8f", optional = true }

@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 
 impl Engine {
     pub(super) fn weight(&self, name: &str) -> Result<&Weight> {
@@ -13,22 +14,36 @@ impl Engine {
             .ok_or_else(|| anyhow!("expected F32 tensor {name}"))
     }
     pub(super) fn zeros(&self, n: usize) -> Result<Buffer> {
-        let recycled = self
-            .pool
-            .borrow_mut()
-            .get_mut(&n)
-            .and_then(|buffers| buffers.pop());
-        let data = match recycled {
-            Some(data) => data,
-            None => DeviceBuffer::zeroed(&self.stream, n)?,
+        let recycled = if self.preallocated {
+            self.pool
+                .borrow_mut()
+                .range_mut(n..)
+                .find_map(|(&capacity, buffers)| buffers.pop().map(|data| (capacity, data)))
+        } else {
+            self.pool
+                .borrow_mut()
+                .get_mut(&n)
+                .and_then(|buffers| buffers.pop())
+                .map(|data| (n, data))
         };
-        // Scratch kernels fully overwrite their outputs. Reuse is ordered on the
-        // same stream, including when an earlier input allocation is recycled.
-        Ok(Buffer {
-            data: Some(data),
-            pool: self.pool.clone(),
-        })
+        let (capacity, data) = match recycled {
+            Some(pair) => pair,
+            None => {
+                anyhow::ensure!(
+                    !self.preallocated,
+                    "preallocated scratch exhausted: requested {n} f32 elements"
+                );
+                (
+                    n,
+                    DeviceBuffer::zeroed(&self.stream, n)
+                        .with_context(|| format!("allocating {n} f32 scratch elements"))?,
+                )
+            }
+        };
+        debug_assert_eq!(capacity, data.len());
+        Buffer::lease(data, n, self.pool.clone())
     }
+
     pub(super) fn mm(&self, name: &str, input: &DeviceBuffer<f32>) -> Result<Buffer> {
         self.mm_prepared(name, input, false)
     }
@@ -51,15 +66,70 @@ impl Engine {
         let cols = w.shape[0];
         let rows = w.shape[1];
         let batch = input.len() / cols;
-        let output = self.zeros(rows * batch)?;
+        let mut output = self.zeros(rows * batch)?;
         // SAFETY: validated matrix layout, matching input and allocated output;
         // every warp has one disjoint output row.
-        if batch > 8 {
+        if batch >= crate::gpu::WIDE_MIN_BATCH
+            && let Some(weight_scale) = w.fp8_scale
+        {
+            let mut work = self.fp8_work.borrow_mut();
+            let work = work
+                .as_mut()
+                .ok_or_else(|| anyhow!("missing FP8 prefill workspace"))?;
+            if !reuse_input {
+                crate::gpu::fp8::prepare(
+                    &self.module,
+                    &self.stream,
+                    input,
+                    &mut work.maxima,
+                    &mut work.scales,
+                    &mut work.packed,
+                )?;
+            }
+            let dynamic = batch >= crate::gpu::fp8_cache::MIN_BATCH
+                && work
+                    .weight_tiles
+                    .as_ref()
+                    .is_some_and(|buffer| buffer.len() >= rows.div_ceil(64) * 64 * cols / 4);
+            if dynamic {
+                crate::gpu::fp8_cache::pack_into(
+                    &self.module,
+                    &self.stream,
+                    w.kind,
+                    cols,
+                    rows,
+                    weight_scale,
+                    &w.data,
+                    work.weight_tiles
+                        .as_mut()
+                        .expect("validated weight workspace"),
+                )?;
+            }
+            crate::gpu::fp8::launch(
+                &self.module,
+                &self.stream,
+                w.kind,
+                cols,
+                rows,
+                batch,
+                weight_scale,
+                &w.data,
+                &work.packed,
+                &work.scales,
+                &mut output,
+                if dynamic {
+                    work.weight_tiles.as_ref()
+                } else {
+                    None
+                },
+            )?;
+        } else if batch > 8 {
             let mut packed = self.prefill_input.borrow_mut();
             if packed
                 .as_ref()
                 .is_none_or(|buffer| buffer.len() < input.len() / 2)
             {
+                anyhow::ensure!(!self.preallocated, "reserved prefill input extent exceeded");
                 *packed = Some(DeviceBuffer::zeroed(&self.stream, input.len() / 2)?);
             }
             let packed = packed
@@ -80,6 +150,7 @@ impl Engine {
                     reuse_input,
                     packed,
                     output.cu_deviceptr() as *mut f32,
+                    self.prefill_tile,
                 )?;
             }
         } else if w.kind == 30 && rows <= 96 {
@@ -110,6 +181,10 @@ impl Engine {
         } else if self.integer && w.kind != 0 && w.kind != 30 {
             let mut work = self.quant_work.borrow_mut();
             if let std::collections::btree_map::Entry::Vacant(entry) = work.entry(input.len()) {
+                anyhow::ensure!(
+                    !self.preallocated,
+                    "unreserved activation quantization extent"
+                );
                 entry.insert(QuantWork {
                     packed: DeviceBuffer::zeroed(&self.stream, input.len() / 4)?,
                     scales: DeviceBuffer::zeroed(&self.stream, input.len() / 32)?,

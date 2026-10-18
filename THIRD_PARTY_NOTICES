@@ -6,6 +6,9 @@ Reference revision: 1268edac579110aeb1407f7928f53193ed4e28d4
 The chunked recurrent algorithm and BF16 residual matrix-product approach
 were also informed by ggml-cuda/gated-delta-net-mma.cu at that revision.
 The corresponding Rust operators are implemented independently.
+The reference sampling seed streams and stochastic draft rejection behavior
+were informed by common/sampling.cpp and common/speculative.cpp at that
+revision; the Rust sampler and verification implementation are independent.
 
 MIT License
 

@@ -10,16 +10,18 @@ use std::time::Instant;
 struct Session {
     engine: Engine,
     tokens: Vec<u32>,
-    checkpoint: Option<Snapshot>,
+    checkpoint: Snapshot,
 }
 
 mod sampling;
 mod session;
+mod stream;
 
 struct Job {
     path: String,
     input: Json,
     reply: tokio::sync::oneshot::Sender<Result<Json>>,
+    stream: Option<stream::Output>,
 }
 
 fn worker(
@@ -32,13 +34,14 @@ fn worker(
         let model = Model::open(&path)?;
         let tokenizer = Tokenizer::from_model(&model)?;
         let engine = Engine::load_from_model(&path, capacity, &model)?;
+        let checkpoint = engine.prepare_checkpoint()?;
         Ok((
             model,
             tokenizer,
             Session {
                 engine,
                 tokens: Vec::new(),
-                checkpoint: None,
+                checkpoint,
             },
         ))
     })();
@@ -55,9 +58,11 @@ fn worker(
     while let Some(job) = jobs.blocking_recv() {
         let response = match job.path.as_str() {
             "/health" => Ok(
-                json!({"status":"ok","backend":"lia.rs","thinking":true,"mtp":true,"sampling_modes":["greedy","top_k_top_p"],"sampling_top_k_max":20,"mtp_max_draft":session.engine.max_draft(),"target_verify_max_batch":session.engine.max_draft()+1,"mtp_state_restore":"captured per-position recurrent states","prefill_batch":512,"prefill_precision":"f16","prefill_small_batch":8,"prefill_tensor_min_tokens":9,"prefill_medium_min_tokens":crate::gpu::MEDIUM_MIN_BATCH,"prefill_wide_min_tokens":crate::gpu::WIDE_MIN_BATCH,"kv_cache":"f16","activation_quantization":session.engine.integer_enabled(),"matrix_split_k":session.engine.matrix_layout().0,"matrix_row_group":session.engine.matrix_layout().1,"matrix_block_threads":session.engine.matrix_threads(),"attention":"partitioned_online_softmax_with_tensor_core_prefill","attention_tile":256,"attention_tensor_min_batch":16,"attention_small_batch_tile":128,"attention_decode_tile":64}),
+                json!({"status":"ok","backend":"lia.rs","attention_workspace_bytes":session.engine.attention_reserved_bytes(),"query_tiled_attention":session.engine.query_tiled_attention(),"gdn_parallel_chunk_preparation":session.engine.gdn_parallel(),"cuda_graph":session.engine.cuda_graph_enabled(),"cuda_graph_stats":session.engine.cuda_graph_stats(),"gpu_buffers_preallocated":session.engine.buffers_preallocated(),"scratch_reserved_bytes":session.engine.scratch_reserved_bytes(),"thinking":true,"mtp":true,"sampling_modes":["greedy","top_k_top_p"],"sampling_top_k_max":20,"mtp_max_draft":session.engine.max_draft(),"stochastic_mtp":session.engine.stochastic_mtp(),"target_verify_max_batch":session.engine.max_draft()+1,"mtp_state_restore":"captured per-position recurrent states","prefill_batch":session.engine.prefill_batch(),"prefill_precision":if session.engine.fp8_prefill(){"mixed_e4m3_f16_f32_accumulation"}else{"f16"},"prefill_fp8_min_tokens":65,"prefill_fp8_tile":128,"prefill_fp8_weight_workspace_bytes":session.engine.fp8_weight_workspace_bytes(),"prefill_fp8_weight_prepack_min_tokens":crate::gpu::fp8_cache::MIN_BATCH,"prefill_small_batch":8,"prefill_tensor_min_tokens":9,"prefill_medium_min_tokens":crate::gpu::MEDIUM_MIN_BATCH,"prefill_wide_min_tokens":crate::gpu::WIDE_MIN_BATCH,"prefill_wide_token_tile":session.engine.prefill_tile(),"kv_cache":"f16","activation_quantization":session.engine.integer_enabled(),"matrix_split_k":session.engine.matrix_layout().0,"matrix_row_group":session.engine.matrix_layout().1,"matrix_block_threads":session.engine.matrix_threads(),"attention":"partitioned_online_softmax_with_tensor_core_prefill","attention_tile":256,"attention_tensor_min_batch":session.engine.attention_mma_min_batch(),"attention_tensor_decode_min_context":512,"attention_small_batch_tile":128,"attention_decode_tile":64}),
             ),
-            "/v1/chat/completions" => session.chat(&model, &tokenizer, &job.input),
+            "/v1/chat/completions" => {
+                session.chat(&model, &tokenizer, &job.input, job.stream.as_ref())
+            }
             "/apply-template" => {
                 crate::chat::render(&model, &job.input).map(|prompt| json!({"prompt":prompt}))
             }
@@ -75,7 +80,26 @@ fn worker(
                 .map(|tokens| json!({"tokens":tokens})),
             _ => Err(anyhow!("unknown endpoint")),
         };
+        let mut stop = false;
+        if response.is_err() && job.path == "/v1/chat/completions" {
+            session.tokens.clear();
+            session.engine.trim_scratch();
+            if let Err(error) = session
+                .engine
+                .reset()
+                .and_then(|()| session.engine.refresh_snapshot(&mut session.checkpoint))
+            {
+                eprintln!("resetting failed inference session: {error:#}");
+                stop = true;
+            }
+        }
+        if let Some(output) = &job.stream {
+            output.finish(&response);
+        }
         let _ = job.reply.send(response);
+        if stop {
+            break;
+        }
     }
 }
 
@@ -83,31 +107,49 @@ async fn handle(
     axum::extract::State(jobs): axum::extract::State<tokio::sync::mpsc::UnboundedSender<Job>>,
     uri: axum::http::Uri,
     body: axum::body::Bytes,
-) -> (axum::http::StatusCode, axum::Json<Json>) {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let result = async {
         let input = if body.is_empty() {
             json!({})
         } else {
             serde_json::from_slice(&body)?
         };
+        if uri.path() == "/v1/chat/completions"
+            && input.get("stream").and_then(Json::as_bool) == Some(true)
+        {
+            let (output, response) = stream::Output::new(&input);
+            let (reply, _) = tokio::sync::oneshot::channel();
+            jobs.send(Job {
+                path: uri.path().to_owned(),
+                input,
+                reply,
+                stream: Some(output),
+            })
+            .map_err(|_| anyhow!("inference worker stopped"))?;
+            return Ok(response);
+        }
         let (reply, response) = tokio::sync::oneshot::channel();
         jobs.send(Job {
             path: uri.path().to_owned(),
             input,
             reply,
+            stream: None,
         })
         .map_err(|_| anyhow!("inference worker stopped"))?;
-        response
+        let value = response
             .await
-            .map_err(|_| anyhow!("inference worker stopped"))?
+            .map_err(|_| anyhow!("inference worker stopped"))??;
+        Ok::<_, anyhow::Error>(axum::Json(value).into_response())
     }
     .await;
     match result {
-        Ok(value) => (axum::http::StatusCode::OK, axum::Json(value)),
+        Ok(value) => value,
         Err(error) => (
             axum::http::StatusCode::BAD_REQUEST,
             axum::Json(json!({"error":{"message":format!("{error:#}")}})),
-        ),
+        )
+            .into_response(),
     }
 }
 

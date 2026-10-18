@@ -30,6 +30,17 @@ impl Engine {
         position: usize,
         logits: bool,
     ) -> Result<(Buffer, Option<Buffer>)> {
+        let capture = self.begin_graph()?;
+        let result = self.mtp_given_inner(token, h, position, logits);
+        self.finish_graph(capture, (2, 1, logits, self.capture), result)
+    }
+    fn mtp_given_inner(
+        &self,
+        token: u32,
+        h: &DeviceBuffer<f32>,
+        position: usize,
+        logits: bool,
+    ) -> Result<(Buffer, Option<Buffer>)> {
         let embedding = self.embed(token)?;
         let en = self.norm("blk.64.nextn.enorm.weight", &embedding, 5120)?;
         let hn = self.norm("blk.64.nextn.hnorm.weight", h, 5120)?;
@@ -57,8 +68,11 @@ impl Engine {
             ["blk.64.ffn_up.weight", "blk.64.ffn_gate.weight"],
             &normalized,
         )?;
-        let activated = self.silu_mul(&up, &gate)?;
+        let activated = self.activate_owned(up, &gate)?;
+        drop(gate);
+        drop(normalized);
         let down = self.mm("blk.64.ffn_down.weight", &activated)?;
+        drop(activated);
         let hidden = self.add(&residual, &down)?;
         let normalized = self.norm("blk.64.nextn.shared_head_norm.weight", &hidden, 5120)?;
         let result = if logits {
@@ -69,17 +83,7 @@ impl Engine {
         Ok((normalized, result))
     }
     pub(super) fn mtp(&self, token: u32, logits: bool) -> Result<Option<Vec<f32>>> {
-        let zero = if self.last_hidden.is_none() {
-            Some(DeviceBuffer::<f32>::zeroed(&self.stream, 5120)?)
-        } else {
-            None
-        };
-        let h: &DeviceBuffer<f32> = match &self.last_hidden {
-            Some(h) => h,
-            None => zero
-                .as_ref()
-                .ok_or_else(|| anyhow!("missing initial hidden state"))?,
-        };
+        let h: &DeviceBuffer<f32> = self.last_hidden.as_deref().unwrap_or(&self.zero_hidden);
         self.mtp_given(token, h, self.position, logits)?
             .1
             .map(|x| Ok(x.to_host_vec(&self.stream)?))
@@ -105,7 +109,10 @@ impl Engine {
         let parts = VOCAB.div_ceil(1024);
         let count = logits.len() / VOCAB * parts;
         let values = self.zeros(count)?;
-        let ids = DeviceBuffer::<u32>::zeroed(&self.stream, count)?;
+        let ids = self
+            .greedy_work
+            .get(&(logits.len() / VOCAB))
+            .ok_or_else(|| anyhow!("greedy batch exceeds reserved workspace"))?;
         // SAFETY: one complete warp per disjoint partition, matching partial
         // value and index arrays. Each input row covers the full vocabulary.
         unsafe {

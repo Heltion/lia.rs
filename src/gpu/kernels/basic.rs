@@ -124,6 +124,15 @@ pub(crate) mod device {
     }
 
     #[kernel]
+    pub fn silu_mul_in_place(gate: &[f32], mut values: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(value) = values.get_mut(idx) {
+            *value = *value * gate[i] / (1.0 + (-gate[i]).exp());
+        }
+    }
+
+    #[kernel]
     pub fn decode(kind: u32, block_bytes: usize, input: &[u8], mut out: DisjointSlice<f32>) {
         let idx = thread::index_1d();
         let i = idx.get();
@@ -144,5 +153,44 @@ pub(crate) mod device {
         if let Some(value) = out.get_mut(idx) {
             *value = x[i] + y[i];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use cuda_core::{CudaContext, DeviceBuffer, simt::LaunchConfig};
+
+    #[test]
+    fn owned_activation_matches_separate_output() -> Result<()> {
+        let context = CudaContext::new(0)?;
+        let stream = context.default_stream();
+        let module = crate::gpu::kernels::load(&context)?;
+        for count in [1, 31, 257, 17408] {
+            let input: Vec<f32> = (0..count).map(|i| (i % 113) as f32 * 0.25 - 13.0).collect();
+            let gates: Vec<f32> = (0..count).map(|i| (i % 503) as f32 - 251.0).collect();
+            let original = DeviceBuffer::from_host(&stream, &input)?;
+            let gate = DeviceBuffer::from_host(&stream, &gates)?;
+            let mut owned = DeviceBuffer::from_host(&stream, &input)?;
+            let mut separate = DeviceBuffer::<f32>::zeroed(&stream, count)?;
+            let config = LaunchConfig::for_num_elems(count as u32);
+            // SAFETY: equal logical lengths and distinct owned allocations.
+            unsafe {
+                module
+                    .basic
+                    .silu_mul(&stream, config, &original, &gate, &mut separate)?;
+                module
+                    .basic
+                    .silu_mul_in_place(&stream, config, &gate, &mut owned)?;
+            }
+            let actual = owned.to_host_vec(&stream)?;
+            let expected = separate.to_host_vec(&stream)?;
+            assert_eq!(
+                actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+            );
+            assert_eq!(original.to_host_vec(&stream)?, input);
+        }
+        Ok(())
     }
 }

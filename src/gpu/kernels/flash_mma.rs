@@ -53,11 +53,13 @@ pub(crate) mod device {
     }
 
     #[kernel]
-    pub unsafe fn flash_mma(
+    pub unsafe fn flash_mma<const GROUPED: bool>(
         q_heads: usize,
         kv_heads: usize,
         tokens: usize,
+        span: usize,
         parts: usize,
+        query_start: usize,
         q: &[f32],
         k: &[u16],
         v: &[u16],
@@ -72,11 +74,15 @@ pub(crate) mod device {
         let kvh = kv_heads as u32;
         let parts = parts as u32;
         let tokens = tokens as u32;
+        let span = span as u32;
         let batch = q.len() as u32 / (qh * 256);
         let part = tid / 256 % parts;
-        let head = tid / 256 / parts % qh;
-        let query_base = tid / 256 / parts / qh * 16;
-        let kh = head / (qh / kvh);
+        let groups = if GROUPED { qh / kvh } else { 1 };
+        let heads = if GROUPED { kvh } else { qh };
+        let head = tid / 256 / parts % heads;
+        let query_base = tid / 256 / parts / heads * 16 + query_start as u32 * groups;
+        let kh = if GROUPED { head } else { head / (qh / kvh) };
+        let queries = batch * groups;
         // Layouts are padded to preserve 16-byte matrix-load alignment. All
         // CTAs are complete and every thread reaches each block barrier.
         let tile = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut TILE) };
@@ -95,8 +101,13 @@ pub(crate) mod device {
             let row = i / 128;
             let col = i % 128 * 2;
             let query = query_base + row;
-            let (a, b) = if query < batch {
-                let at = ((query * qh + head) * 256 + col) as usize;
+            let (a, b) = if query < queries {
+                let query_head = if GROUPED {
+                    kh * groups + query % groups
+                } else {
+                    head
+                };
+                let at = (((query / groups) * qh + query_head) * 256 + col) as usize;
                 unsafe { (*q.get_unchecked(at), *q.get_unchecked(at + 1)) }
             } else {
                 (0.0, 0.0)
@@ -108,10 +119,10 @@ pub(crate) mod device {
             i += 256;
         }
         thread::sync_threads();
-        let end = ((part + 1) * 256)
+        let end = ((part + 1) * span)
             .min(tokens)
-            .min(tokens - batch + (query_base + 16).min(batch));
-        let mut start = part * 256;
+            .min(tokens - batch + ((query_base + 16).min(queries) - 1) / groups + 1);
+        let mut start = part * span;
         while start < end {
             i = local;
             while i < 32 * 128 {
@@ -146,8 +157,8 @@ pub(crate) mod device {
             let mut r = 0;
             while r < 2 {
                 let row = warp_id + r * 8;
-                let valid = query_base + row < batch
-                    && start + lane < tokens - batch + query_base + row + 1
+                let valid = query_base + row < queries
+                    && start + lane < tokens - batch + (query_base + row) / groups + 1
                     && start + lane < tokens;
                 let score = if valid {
                     unsafe { *scores.add((row * 32 + lane) as usize) }
@@ -248,8 +259,16 @@ pub(crate) mod device {
             while r < 2 {
                 let row = lane / 4 + r * 8;
                 let query = query_base + row;
-                if query < batch {
-                    let base = (((query * qh + head) * parts + part) * 258) as usize;
+                if query < queries {
+                    let query_head = if GROUPED {
+                        kh * groups + query % groups
+                    } else {
+                        head
+                    };
+                    let base = (((((query / groups - query_start as u32) * qh + query_head)
+                        * parts)
+                        + part)
+                        * 258) as usize;
                     unsafe {
                         *partial.add(base + col as usize) = output[j][r as usize * 2];
                         *partial.add(base + col as usize + 1) = output[j][r as usize * 2 + 1];

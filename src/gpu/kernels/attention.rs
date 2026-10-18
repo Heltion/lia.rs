@@ -17,6 +17,7 @@ pub(crate) mod device {
         groups: usize,
         parts: usize,
         cap_parts: usize,
+        group_offset: usize,
         partial: &[f32],
         qgate: &[f32],
         out: *mut f32,
@@ -73,36 +74,57 @@ pub(crate) mod device {
             }
             unsafe {
                 if lane < DIM {
-                    *out.add(group * DIM + lane) =
-                        o0 / sum / (1.0 + (-qgate[group * DIM * 2 + DIM + lane]).exp());
+                    *out.add((group + group_offset) * DIM + lane) = o0
+                        / sum
+                        / (1.0 + (-qgate[(group + group_offset) * DIM * 2 + DIM + lane]).exp());
                 }
                 if lane + 32 < DIM {
-                    *out.add(group * DIM + lane + 32) =
-                        o1 / sum / (1.0 + (-qgate[group * DIM * 2 + DIM + lane + 32]).exp());
+                    *out.add((group + group_offset) * DIM + lane + 32) = o1
+                        / sum
+                        / (1.0
+                            + (-qgate[(group + group_offset) * DIM * 2 + DIM + lane + 32]).exp());
                 }
                 if lane + 2 * 32 < DIM {
-                    *out.add(group * DIM + lane + 2 * 32) =
-                        o2 / sum / (1.0 + (-qgate[group * DIM * 2 + DIM + lane + 2 * 32]).exp());
+                    *out.add((group + group_offset) * DIM + lane + 2 * 32) = o2
+                        / sum
+                        / (1.0
+                            + (-qgate[(group + group_offset) * DIM * 2 + DIM + lane + 2 * 32])
+                                .exp());
                 }
                 if lane + 3 * 32 < DIM {
-                    *out.add(group * DIM + lane + 3 * 32) =
-                        o3 / sum / (1.0 + (-qgate[group * DIM * 2 + DIM + lane + 3 * 32]).exp());
+                    *out.add((group + group_offset) * DIM + lane + 3 * 32) = o3
+                        / sum
+                        / (1.0
+                            + (-qgate[(group + group_offset) * DIM * 2 + DIM + lane + 3 * 32])
+                                .exp());
                 }
                 if lane + 4 * 32 < DIM {
-                    *out.add(group * DIM + lane + 4 * 32) =
-                        o4 / sum / (1.0 + (-qgate[group * DIM * 2 + DIM + lane + 4 * 32]).exp());
+                    *out.add((group + group_offset) * DIM + lane + 4 * 32) = o4
+                        / sum
+                        / (1.0
+                            + (-qgate[(group + group_offset) * DIM * 2 + DIM + lane + 4 * 32])
+                                .exp());
                 }
                 if lane + 5 * 32 < DIM {
-                    *out.add(group * DIM + lane + 5 * 32) =
-                        o5 / sum / (1.0 + (-qgate[group * DIM * 2 + DIM + lane + 5 * 32]).exp());
+                    *out.add((group + group_offset) * DIM + lane + 5 * 32) = o5
+                        / sum
+                        / (1.0
+                            + (-qgate[(group + group_offset) * DIM * 2 + DIM + lane + 5 * 32])
+                                .exp());
                 }
                 if lane + 6 * 32 < DIM {
-                    *out.add(group * DIM + lane + 6 * 32) =
-                        o6 / sum / (1.0 + (-qgate[group * DIM * 2 + DIM + lane + 6 * 32]).exp());
+                    *out.add((group + group_offset) * DIM + lane + 6 * 32) = o6
+                        / sum
+                        / (1.0
+                            + (-qgate[(group + group_offset) * DIM * 2 + DIM + lane + 6 * 32])
+                                .exp());
                 }
                 if lane + 7 * 32 < DIM {
-                    *out.add(group * DIM + lane + 7 * 32) =
-                        o7 / sum / (1.0 + (-qgate[group * DIM * 2 + DIM + lane + 7 * 32]).exp());
+                    *out.add((group + group_offset) * DIM + lane + 7 * 32) = o7
+                        / sum
+                        / (1.0
+                            + (-qgate[(group + group_offset) * DIM * 2 + DIM + lane + 7 * 32])
+                                .exp());
                 }
             }
         }
@@ -357,6 +379,7 @@ mod tests {
                 qh,
                 parts,
                 cap_parts,
+                0,
                 &partial,
                 &dg,
                 fused.cu_deviceptr() as *mut f32,

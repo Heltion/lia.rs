@@ -9,6 +9,10 @@ use dispatch::launch_matvec;
 pub(crate) use dispatch::{launch_int_matmul, launch_matmul};
 pub use inspection::kernel_info;
 
+pub(crate) const MAX_PREFILL_BATCH: usize = 4096;
+
+pub(crate) mod fp8;
+pub(crate) mod fp8_cache;
 mod tensor;
 pub(crate) use tensor::launch_prefill_matrix;
 pub(crate) use tensor::{MEDIUM_MIN_BATCH, WIDE_MIN_BATCH};

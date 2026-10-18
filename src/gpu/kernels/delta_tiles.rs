@@ -38,42 +38,10 @@ pub(super) unsafe fn prepare(
     decay: &[f32],
     beta: &[f32],
 ) {
-    #[repr(C, align(8))]
-    #[derive(Clone, Copy)]
-    struct Floats2 {
-        data: [f32; 2],
+    unsafe {
+        prepare_qk(q, k, head, k_heads, start, valid, local, qk);
     }
-    let mut i = local;
-    while i < 1024 {
-        let t = i / 64;
-        let d = (i % 64) * 2;
-        let mut qv = [0.0; 2];
-        let mut kv = [0.0; 2];
-        if t < valid {
-            let index = (start + t) * 2 * k_heads * 128 + (head % k_heads) * 128 + d;
-            // SAFETY: all columns are even, both complete pairs are in the
-            //128-wide allocation, and row starts preserve8-byte alignment.
-            unsafe {
-                qv = qk
-                    .as_ptr()
-                    .add(index as usize)
-                    .cast::<Floats2>()
-                    .read()
-                    .data;
-                kv = qk
-                    .as_ptr()
-                    .add((index + k_heads * 128) as usize)
-                    .cast::<Floats2>()
-                    .read()
-                    .data;
-            }
-        }
-        unsafe {
-            q.store_pair(t, d, qv[0], qv[1]);
-            k.store_pair(t, d, kv[0], kv[1]);
-        }
-        i += 256;
-    }
+    let mut i;
     if local < 16 {
         let (a, b) = if local < valid {
             let index = ((start + local) * v_heads + head) as usize;
@@ -140,5 +108,56 @@ pub(super) unsafe fn invert(tile: *mut u32, inverse: Matrix, warp: u32, lane: u3
             }
         }
         row += 8;
+    }
+}
+
+/// Load chunk Q/K operands independently of the head-specific decay coefficients.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn prepare_qk(
+    q: Matrix,
+    k: Matrix,
+    head: u32,
+    k_heads: u32,
+    start: u32,
+    valid: u32,
+    local: u32,
+    qk: &[f32],
+) {
+    #[repr(C, align(8))]
+    #[derive(Clone, Copy)]
+    struct Floats2 {
+        data: [f32; 2],
+    }
+    let mut i = local;
+    while i < 1024 {
+        let t = i / 64;
+        let d = (i % 64) * 2;
+        let mut qv = [0.0; 2];
+        let mut kv = [0.0; 2];
+        if t < valid {
+            let index = (start + t) * 2 * k_heads * 128 + (head % k_heads) * 128 + d;
+            // SAFETY: all columns are even, both complete pairs are in the
+            //128-wide allocation, and row starts preserve8-byte alignment.
+            unsafe {
+                qv = qk
+                    .as_ptr()
+                    .add(index as usize)
+                    .cast::<Floats2>()
+                    .read()
+                    .data;
+                kv = qk
+                    .as_ptr()
+                    .add((index + k_heads * 128) as usize)
+                    .cast::<Floats2>()
+                    .read()
+                    .data;
+            }
+        }
+        unsafe {
+            q.store_pair(t, d, qv[0], qv[1]);
+            k.store_pair(t, d, kv[0], kv[1]);
+        }
+        i += 256;
     }
 }

@@ -19,12 +19,14 @@ pub(crate) unsafe fn launch_prefill_matrix(
     reuse_input: bool,
     packed_input: &DeviceBuffer<u32>,
     output: *mut f32,
+    wide_tokens: usize,
 ) -> anyhow::Result<()> {
     let (elements, bytes) =
         crate::gguf::layout(kind).ok_or_else(|| anyhow!("unsupported prefill matrix format"))?;
     anyhow::ensure!(
         rows.checked_mul(cols)
             .is_some_and(|n| n <= u32::MAX as usize)
+            && [64, 128].contains(&wide_tokens)
             && batch
                 .checked_mul(rows)
                 .is_some_and(|n| n <= u32::MAX as usize)
@@ -34,7 +36,7 @@ pub(crate) unsafe fn launch_prefill_matrix(
             && cols > 0
             && rows > 0
             && cols.is_multiple_of(256)
-            && (1..=512).contains(&batch)
+            && (1..=super::MAX_PREFILL_BATCH).contains(&batch)
             && (packed_input.cu_deviceptr() as usize).is_multiple_of(16)
             && packed_input.len() >= batch * cols / 2
             && input.len() == batch * cols
@@ -53,7 +55,7 @@ pub(crate) unsafe fn launch_prefill_matrix(
         }
     }
     let tokens = if batch >= WIDE_MIN_BATCH {
-        128
+        wide_tokens
     } else if batch >= MEDIUM_MIN_BATCH {
         64
     } else {
@@ -66,7 +68,7 @@ pub(crate) unsafe fn launch_prefill_matrix(
     };
     macro_rules! launch {
         ($kind:literal, $bytes:literal) => {
-            if batch >= WIDE_MIN_BATCH {
+            if tokens == 128 {
                 module.wide_prefill.prefill_wide::<$kind, $bytes, 128>(
                     stream,
                     config,
@@ -77,7 +79,7 @@ pub(crate) unsafe fn launch_prefill_matrix(
                     packed_input,
                     output,
                 )?;
-            } else if batch >= MEDIUM_MIN_BATCH {
+            } else if tokens == 64 {
                 module.wide_prefill.prefill_wide::<$kind, $bytes, 64>(
                     stream,
                     config,
@@ -137,7 +139,8 @@ mod tests {
         let module = kernels::load(&context)?;
         let (cols, rows) = (768, 143);
         for batch in [
-            9, 31, 32, 33, 63, 64, 65, 66, 96, 97, 127, 128, 129, 255, 256, 257, 512,
+            9, 31, 32, 33, 63, 64, 65, 66, 96, 97, 127, 128, 129, 255, 256, 257, 385, 512, 1024,
+            2048,
         ] {
             let input: Vec<f32> = (0..cols * batch)
                 .map(|i| ((i * 71 % 257) as f32 - 128.0) * 0.003)
@@ -160,6 +163,9 @@ mod tests {
                 (23, 136),
                 (29, 56),
             ] {
+                if batch == 2048 && kind != 17 {
+                    continue;
+                }
                 let block_size = if kind == 0 || kind == 30 { 1 } else { 256 };
                 let mut weights: Vec<u8> = (0..rows * (cols / block_size) * size)
                     .map(|i| ((i * 73 + 19) % 256) as u8)
@@ -217,10 +223,38 @@ mod tests {
                         reuse_input,
                         &packed_input,
                         output.cu_deviceptr() as *mut f32,
+                        128,
                     )?;
                 }
                 reuse_input = true;
                 let actual = output.to_host_vec(&stream)?;
+                if batch >= 65 {
+                    {
+                        let alternate = 64;
+                        // SAFETY: each tile variant covers the same complete matrices.
+                        unsafe {
+                            crate::gpu::launch_prefill_matrix(
+                                &module,
+                                &stream,
+                                kind,
+                                cols,
+                                rows,
+                                batch,
+                                &gpu_weights,
+                                &gpu_input,
+                                true,
+                                &packed_input,
+                                output.cu_deviceptr() as *mut f32,
+                                alternate,
+                            )?;
+                        }
+                        assert_eq!(
+                            output.to_host_vec(&stream)?,
+                            actual,
+                            "prefill tile changes output: kind={kind}, batch={batch}, tile={alternate}"
+                        );
+                    }
+                }
                 for row in 0..rows {
                     let mut decoded = Vec::new();
                     for block in weights

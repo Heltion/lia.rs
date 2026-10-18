@@ -1,5 +1,5 @@
 //! Packed weight tiles reused across wide token groups without global expansion.
-use cuda_device::{kernel, thread};
+use cuda_device::{kernel, launch_bounds, thread};
 use cuda_host::cuda_module;
 
 #[allow(clippy::too_many_arguments)]
@@ -20,8 +20,16 @@ pub(crate) mod device {
         cuda_device::convert::cvt_f16x2_f32(a, b)
     }
 
+    // Permute aligned eight-half groups across banks instead of padding rows.
+    // Each ldmatrix address still names an unchanged contiguous eight-half group.
+    #[inline(always)]
+    fn shared_index(row: u32, word: u32) -> usize {
+        (row * 32 + (word ^ ((row & 7) * 4))) as usize
+    }
+
     /// Reuse each decoded 64-row weight tile across 64 or 128 token columns.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn prefill_wide<const KIND: u32, const BYTES: usize, const TOKENS: u32>(
         cols: usize,
         rows: usize,
@@ -38,16 +46,19 @@ pub(crate) mod device {
         let rows = rows as u32;
         let batch = batch as u32;
         let tile_id = tid / 256;
-        let row_base = tile_id % rows.div_ceil(64) * 64;
-        let token_base = tile_id / rows.div_ceil(64) * TOKENS;
+        // Adjacent CTAs consume the same weight rows for neighboring token tiles,
+        // retaining their working set in L2 instead of sweeping the full matrix.
+        let token_tiles = batch.div_ceil(TOKENS);
+        let row_base = tile_id / token_tiles * 64;
+        let token_base = tile_id % token_tiles * TOKENS;
         // SAFETY: every CTA fills disjoint words and reaches both barriers;
         // all row/token tails are padded before the warp matrix loads.
         let tile = if TOKENS == 128 {
-            static mut TILE128: cuda_device::SharedArray<u32, 6912, 16> =
+            static mut TILE128: cuda_device::SharedArray<u32, 6144, 16> =
                 cuda_device::SharedArray::UNINIT;
             unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut TILE128) }
         } else {
-            static mut TILE64: cuda_device::SharedArray<u32, 4608, 16> =
+            static mut TILE64: cuda_device::SharedArray<u32, 4096, 16> =
                 cuda_device::SharedArray::UNINIT;
             unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut TILE64) }
         };
@@ -59,13 +70,14 @@ pub(crate) mod device {
         let mut sum11 = [0.0f32; 4];
         let mut sum12 = [0.0f32; 4];
         let mut sum13 = [0.0f32; 4];
+
         let mut col = 0;
         while col < cols {
             let mut vec = local;
             while vec < 512 {
                 let row = row_base + vec / 8;
                 let k = (vec % 8) * 8;
-                let dest = ((vec / 8) * 36 + k / 2) as usize;
+                let dest = shared_index(vec / 8, k / 2);
                 if KIND == 0 || KIND == 30 {
                     let mut j = 0;
                     while j < 4 {
@@ -135,7 +147,7 @@ pub(crate) mod device {
                     Words4 { data: [0; 4] }
                 };
                 unsafe {
-                    tile.add((2304 + (i / 32) * 36 + i % 32) as usize)
+                    tile.add(2048 + shared_index(i / 32, i % 32))
                         .cast::<Words4>()
                         .write(x);
                 }
@@ -149,48 +161,32 @@ pub(crate) mod device {
             while j < 4 {
                 // SAFETY: completed padded tiles match each MMA fragment layout.
                 unsafe {
-                    let a0 =
-                        cuda_device::wmma::ldmatrix_x4(tile.add(
-                            ((group + lane % 16) * 36 + (lane / 16) * 4 + j as u32 * 8) as usize,
-                        ));
-                    let a1 = cuda_device::wmma::ldmatrix_x4(tile.add(
-                        ((group + 16 + lane % 16) * 36 + (lane / 16) * 4 + j as u32 * 8) as usize,
-                    ));
+                    let a0 = cuda_device::wmma::ldmatrix_x4(tile.add(shared_index(
+                        group + lane % 16,
+                        (lane / 16) * 4 + j as u32 * 8,
+                    )));
+                    let a1 = cuda_device::wmma::ldmatrix_x4(tile.add(shared_index(
+                        group + 16 + lane % 16,
+                        (lane / 16) * 4 + j as u32 * 8,
+                    )));
 
-                    let b = cuda_device::wmma::ldmatrix_x2(tile.add(
-                        (2304 + (token_group + lane % 8) * 36 + ((lane / 8) % 2) * 4 + j as u32 * 8)
-                            as usize,
-                    ));
-                    sum00 = cuda_device::wmma::mma_m16n8k16_f32_f16(sum00, a0, b);
-                    sum10 = cuda_device::wmma::mma_m16n8k16_f32_f16(sum10, a1, b);
-
-                    let b = cuda_device::wmma::ldmatrix_x2(tile.add(
-                        (2304
-                            + (token_group + 8 + lane % 8) * 36
-                            + ((lane / 8) % 2) * 4
-                            + j as u32 * 8) as usize,
-                    ));
-                    sum01 = cuda_device::wmma::mma_m16n8k16_f32_f16(sum01, a0, b);
-                    sum11 = cuda_device::wmma::mma_m16n8k16_f32_f16(sum11, a1, b);
-
-                    if TOKENS == 128 {
-                        let b = cuda_device::wmma::ldmatrix_x2(tile.add(
-                            (2304
-                                + (token_group + 16 + lane % 8) * 36
-                                + ((lane / 8) % 2) * 4
-                                + j as u32 * 8) as usize,
-                        ));
-                        sum02 = cuda_device::wmma::mma_m16n8k16_f32_f16(sum02, a0, b);
-                        sum12 = cuda_device::wmma::mma_m16n8k16_f32_f16(sum12, a1, b);
-
-                        let b = cuda_device::wmma::ldmatrix_x2(tile.add(
-                            (2304
-                                + (token_group + 24 + lane % 8) * 36
-                                + ((lane / 8) % 2) * 4
-                                + j as u32 * 8) as usize,
-                        ));
-                        sum03 = cuda_device::wmma::mma_m16n8k16_f32_f16(sum03, a0, b);
-                        sum13 = cuda_device::wmma::mma_m16n8k16_f32_f16(sum13, a1, b);
+                    macro_rules! product {
+                        ($offset:literal, $upper:ident, $lower:ident) => {{
+                            let b = cuda_device::wmma::ldmatrix_x2(tile.add(
+                                2048 + shared_index(
+                                    token_group + $offset + lane % 8,
+                                    ((lane / 8) % 2) * 4 + j as u32 * 8,
+                                ),
+                            ));
+                            $upper = cuda_device::wmma::mma_m16n8k16_f32_f16($upper, a0, b);
+                            $lower = cuda_device::wmma::mma_m16n8k16_f32_f16($lower, a1, b);
+                        }};
+                    }
+                    product!(0, sum00, sum10);
+                    product!(8, sum01, sum11);
+                    if TOKENS >= 128 {
+                        product!(16, sum02, sum12);
+                        product!(24, sum03, sum13);
                     }
                 }
                 j += 1;
@@ -208,7 +204,7 @@ pub(crate) mod device {
             store(rows, batch, row, token + 8, sum01, output);
             store(rows, batch, row + 16, token + 8, sum11, output);
 
-            if TOKENS == 128 {
+            if TOKENS >= 128 {
                 store(rows, batch, row, token + 16, sum02, output);
                 store(rows, batch, row + 16, token + 16, sum12, output);
 
