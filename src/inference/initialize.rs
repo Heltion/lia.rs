@@ -107,6 +107,7 @@ impl Engine {
             prefill_input: RefCell::new(None),
             preallocated: cuda_graph || std::env::var("LIA_PREALLOCATE").as_deref() == Ok("1"),
             cuda_graph,
+            decode_replay: RefCell::new(None),
             graphs: RefCell::new(BTreeMap::new()),
             graph_stats: RefCell::new([0; 3]),
             scratch_reserved: 0,

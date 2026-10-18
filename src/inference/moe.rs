@@ -35,7 +35,7 @@ impl Engine {
         unsafe {
             self.module.moe.route(
                 &self.stream,
-                LaunchConfig::for_num_elems(batch as u32),
+                LaunchConfig::for_num_elems((batch * 32) as u32),
                 &logits,
                 routing.selected.cu_deviceptr() as *mut u32,
                 routing.probabilities.cu_deviceptr() as *mut f32,

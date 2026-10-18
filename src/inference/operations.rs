@@ -155,6 +155,29 @@ impl Engine {
                     self.prefill_tile,
                 )?;
             }
+        } else if w.kind == 30 && rows == 256 && cols.is_multiple_of(128) {
+            anyhow::ensure!(
+                rows.checked_mul(cols).and_then(|n| n.checked_mul(2)) == Some(w.data.len()),
+                "invalid BF16 router weight extent"
+            );
+            // SAFETY: complete aligned BF16 rows and 128-column groups. Each
+            // full warp preserves the original lane FMA and reduction order.
+            unsafe {
+                self.module.bf16_router.bf16_router_matvec(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: ((rows * batch * 32).div_ceil(64) as u32, 1, 1),
+                        block_dim: (64, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    cols,
+                    rows,
+                    batch,
+                    &w.data,
+                    input,
+                    output.cu_deviceptr() as *mut f32,
+                )?;
+            }
         } else if w.kind == 30 && rows <= 96 {
             let parts = cols.div_ceil(256);
             let partial = self.zeros(parts * rows * batch)?;

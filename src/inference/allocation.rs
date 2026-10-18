@@ -62,6 +62,7 @@ impl Engine {
             attention_plan::reserved_bytes(
                 batch,
                 self.capacity,
+                self.geometry.query_heads,
                 self.attention_mma_decode,
                 self.attention_query_tiles,
             )

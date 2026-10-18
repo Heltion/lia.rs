@@ -53,41 +53,50 @@ pub(crate) fn matmul(
     // SAFETY: all extents and complete warp geometry are checked above. One
     // warp owns each output, and all data resides on the supplied stream.
     unsafe {
-        macro_rules! launch {
-            ($bits:literal) => {
-                if columns.is_multiple_of(128) && group_size >= 128 {
-                    module.gsq.matvec4::<$bits>(
-                        stream,
-                        LaunchConfig::for_num_elems(threads),
-                        columns,
-                        rows,
-                        batch,
-                        group_size.trailing_zeros(),
-                        packed,
-                        scales,
-                        input,
-                        output.cu_deviceptr() as *mut f32,
-                    )?;
-                } else {
-                    module.gsq.matmul::<$bits>(
-                        stream,
-                        LaunchConfig::for_num_elems(threads),
-                        columns,
-                        rows,
-                        batch,
-                        group_size.trailing_zeros(),
-                        packed,
-                        scales,
-                        input,
-                        output.cu_deviceptr() as *mut f32,
-                    )?;
-                }
+        macro_rules! vector {
+            ($bits:literal, $channel:literal) => {
+                module.gsq.matvec4::<$bits, $channel>(
+                    stream,
+                    LaunchConfig::for_num_elems(threads),
+                    columns,
+                    rows,
+                    batch,
+                    group_size.trailing_zeros(),
+                    packed,
+                    scales,
+                    input,
+                    output.cu_deviceptr() as *mut f32,
+                )?
             };
         }
-        if bits == 2 {
-            launch!(2);
+        macro_rules! scalar {
+            ($bits:literal) => {
+                module.gsq.matmul::<$bits>(
+                    stream,
+                    LaunchConfig::for_num_elems(threads),
+                    columns,
+                    rows,
+                    batch,
+                    group_size.trailing_zeros(),
+                    packed,
+                    scales,
+                    input,
+                    output.cu_deviceptr() as *mut f32,
+                )?
+            };
+        }
+        if columns.is_multiple_of(128) && group_size >= 128 {
+            match (bits, group_size == columns) {
+                (2, false) => vector!(2, false),
+                (2, true) => vector!(2, true),
+                (8, false) => vector!(8, false),
+                (8, true) => vector!(8, true),
+                _ => unreachable!(),
+            }
+        } else if bits == 2 {
+            scalar!(2);
         } else {
-            launch!(8);
+            scalar!(8);
         }
     }
     Ok(())
@@ -103,7 +112,7 @@ mod tests {
         let context = CudaContext::new(0)?;
         let stream = context.default_stream();
         let module = kernels::load(&context)?;
-        for (bits, group_size) in [(2, 128), (8, 128), (8, 256)] {
+        for (bits, group_size) in [(2, 128), (2, 256), (8, 128), (8, 256)] {
             let (rows, columns, batch) = (35, 256, 3);
             let packed = (0..rows * columns / (8 / bits as usize))
                 .map(|i| (i.wrapping_mul(73).wrapping_add(29)) as u8)

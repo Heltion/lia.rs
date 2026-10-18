@@ -88,3 +88,56 @@ fn native_vision_matches_official_transformer_features() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires LIA_TEST_GSQ_MODEL and sufficient CUDA memory"]
+fn decode_graph_replay_preserves_sampling_across_boundaries_and_reset() -> Result<()> {
+    let path = std::env::var("LIA_TEST_GSQ_MODEL")?;
+    let tokenizer = Tokenizer::from_huggingface(&path)?;
+    let mut prefix = tokenizer.encode(
+        "An independent check of graph replay and recurrent state.",
+        false,
+    )?;
+    let inputs = tokenizer.encode("The quick brown fox jumps over the lazy dog. ", false)?;
+    if std::env::var("LIA_ATTN_MMA_DECODE").as_deref() == Ok("1") {
+        prefix = prefix.into_iter().cycle().take(490).collect();
+    }
+    let mut engine = Engine::load_huggingface(&path, 1024, false)?;
+    engine.forward_many(&prefix, false)?;
+    let mut reference = Vec::new();
+    let mut sampling = lia::sampling::Sampling::new(1.0, 20, 0.95, 42)?;
+    for token in inputs.iter().cycle().take(132) {
+        engine.forward(*token)?;
+        reference.push((
+            engine.current_token()?,
+            engine.current_sample(&mut sampling)?,
+        ));
+    }
+    for pass in 0..2 {
+        engine.reset()?;
+        engine.forward_many(&prefix, false)?;
+        let before = engine.cuda_graph_stats();
+        let mut sampling = lia::sampling::Sampling::new(1.0, 20, 0.95, 42)?;
+        for (index, (token, expected)) in inputs.iter().cycle().zip(&reference).enumerate() {
+            if index == 60 {
+                assert!(engine.speculate(248320, 1, u32::MAX).is_err());
+                let snapshot = engine.snapshot()?;
+                let (_, next, _, _) = engine.speculate(*token, 1, u32::MAX)?;
+                assert_eq!(next, expected.0, "before snapshot restore");
+                engine.restore(&snapshot)?;
+            }
+            let (_, next, _, _) = engine.speculate(*token, 1, u32::MAX)?;
+            assert_eq!(next, expected.0, "greedy pass={pass} step={index}");
+            assert_eq!(
+                engine.current_sample(&mut sampling)?,
+                expected.1,
+                "sample pass={pass} step={index}"
+            );
+        }
+        let after = engine.cuda_graph_stats();
+        if engine.cuda_graph_enabled() {
+            assert!(after[2] - before[2] < 8, "decode recaptures every token");
+        }
+    }
+    Ok(())
+}

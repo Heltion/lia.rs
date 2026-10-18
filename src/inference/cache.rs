@@ -158,6 +158,7 @@ impl Engine {
         Ok(())
     }
     pub fn reset(&mut self) -> Result<()> {
+        self.decode_replay.borrow_mut().take();
         self.stream.synchronize()?;
         for state in &mut self.states {
             match state {

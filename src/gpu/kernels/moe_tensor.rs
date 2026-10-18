@@ -7,6 +7,12 @@ use cuda_host::cuda_module;
 pub(crate) mod device {
     use super::*;
 
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    struct Float4 {
+        values: [f32; 4],
+    }
+
     // Preserve aligned eight-half groups while distributing matrix rows
     // across shared-memory banks, matching the independent GSQ tile layout.
     #[inline(always)]
@@ -14,31 +20,39 @@ pub(crate) mod device {
         row * 32 + (word ^ ((row & 7) * 4))
     }
 
+    // Eight coefficients share one BF16 group scale. Decode one aligned word
+    // into four half pairs before writing the contiguous shared-memory group.
     #[inline(always)]
-    fn value<const HOST: bool>(
+    fn values<const HOST: bool>(
         packed: &[u8],
         scales: &[u16],
         host: *const u8,
         host_scales: *const u16,
-        columns: usize,
-        row: usize,
-        column: usize,
-    ) -> f32 {
-        let index = row * columns + column;
-        let (byte, scale) = if !HOST || index / 4 < packed.len() {
-            (packed[index / 4], scales[index / 128])
+        index: usize,
+    ) -> [u32; 4] {
+        let (word, scale) = if !HOST || index / 4 < packed.len() {
+            (
+                unsafe { packed.as_ptr().add(index / 4).cast::<u16>().read() },
+                unsafe { *scales.get_unchecked(index / 128) },
+            )
         } else {
-            // SAFETY: the host launcher owns a mapped, immutable suffix with
-            // exactly the remaining expert rows for this projection.
             unsafe {
                 (
-                    *host.add(index / 4 - packed.len()),
+                    *host.add(index / 4 - packed.len()).cast::<u16>(),
                     *host_scales.add(index / 128 - scales.len()),
                 )
             }
         };
-        let code = ((byte >> ((index % 4) * 2)) & 3) as i32 - 2;
-        code as f32 * f32::from_bits((scale as u32) << 16)
+        let scale = f32::from_bits((scale as u32) << 16);
+        let mut result = [0; 4];
+        let mut j = 0;
+        while j < 4 {
+            let a = (((word >> (j * 4)) & 3) as i32 - 2) as f32 * scale;
+            let b = (((word >> (j * 4 + 2)) & 3) as i32 - 2) as f32 * scale;
+            result[j] = cuda_device::convert::cvt_f16x2_f32(a, b);
+            j += 1;
+        }
+        result
     }
 
     #[kernel]
@@ -60,7 +74,16 @@ pub(crate) mod device {
         input: &[f32],
         output: *mut f32,
     ) {
-        static mut TILE: cuda_device::SharedArray<u32, 4608, 16> = cuda_device::SharedArray::UNINIT;
+        let tile = if GATE {
+            static mut GATE_TILE: cuda_device::SharedArray<u32, 4608, 16> =
+                cuda_device::SharedArray::UNINIT;
+            unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut GATE_TILE) }
+        } else {
+            static mut DOWN_TILE: cuda_device::SharedArray<u32, 2560, 16> =
+                cuda_device::SharedArray::UNINIT;
+            unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut DOWN_TILE) }
+        };
+        let input_base = if GATE { 4096 } else { 2048 };
         let tid = thread::index_1d().get();
         let local = tid % 128;
         let lane = local % 32;
@@ -75,79 +98,67 @@ pub(crate) mod device {
         let token_base = tiles[2 + descriptor * 2] as usize;
         // All live CTAs reach both barriers. The descriptor bounds guarantee
         // sixteen disjoint choices; row/choice tails are zero padded.
-        let tile = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut TILE) };
         let mut sum0 = [0.0f32; 4];
         let mut sum1 = [0.0f32; 4];
         let mut upper0 = [0.0f32; 4];
         let mut upper1 = [0.0f32; 4];
         let mut col = 0;
         while col < cols {
-            let mut pair = local;
-            while pair < 2048 {
-                let row = row_base + pair / 32;
-                let column = col + pair % 32 * 2;
-                let (a, b, u, v) = if row < rows {
-                    let r = expert * rows + row;
-                    (
-                        value::<HOST>(weights, scales, host_weights, host_scales, cols, r, column),
-                        value::<HOST>(
-                            weights,
-                            scales,
-                            host_weights,
-                            host_scales,
-                            cols,
-                            r,
-                            column + 1,
-                        ),
-                        if GATE {
-                            value::<HOST>(up, up_scales, host_up, host_up_scales, cols, r, column)
-                        } else {
-                            0.0
-                        },
-                        if GATE {
-                            value::<HOST>(
-                                up,
-                                up_scales,
-                                host_up,
-                                host_up_scales,
-                                cols,
-                                r,
-                                column + 1,
-                            )
-                        } else {
-                            0.0
-                        },
-                    )
+            let mut vector = local;
+            while vector < 512 {
+                let row = row_base + vector / 8;
+                let column = col + vector % 8 * 8;
+                let index = (expert * rows + row) * cols + column;
+                let gate = if row < rows {
+                    values::<HOST>(weights, scales, host_weights, host_scales, index)
                 } else {
-                    (0.0, 0.0, 0.0, 0.0)
+                    [0; 4]
                 };
-                unsafe {
-                    *tile.add(shared_index(pair / 32, pair % 32)) =
-                        cuda_device::convert::cvt_f16x2_f32(a, b);
-                    if GATE {
-                        *tile.add(2048 + shared_index(pair / 32, pair % 32)) =
-                            cuda_device::convert::cvt_f16x2_f32(u, v);
+                let upper = if GATE && row < rows {
+                    values::<HOST>(up, up_scales, host_up, host_up_scales, index)
+                } else {
+                    [0; 4]
+                };
+                let at = shared_index(vector / 8, vector % 8 * 4);
+                let mut j = 0;
+                #[unroll]
+                while j < 4 {
+                    unsafe {
+                        *tile.add(at + j) = gate[j];
+                        if GATE {
+                            *tile.add(2048 + at + j) = upper[j];
+                        }
                     }
+                    j += 1;
                 }
-                pair += 128;
+                vector += 128;
             }
-            let mut pair = local;
-            while pair < 512 {
-                let slot = token_base + pair / 32;
-                let column = col + pair % 32 * 2;
-                let (a, b) = if slot < counts[expert] as usize {
+            let mut vector = local;
+            while vector < 256 {
+                let slot = token_base + vector / 16;
+                let column = col + vector % 16 * 4;
+                let x = if slot < counts[expert] as usize {
                     let choice = choices[expert * batch + slot] as usize;
                     let source = if GATE { choice / 8 } else { choice };
-                    let at = source * cols + column;
-                    (input[at], input[at + 1])
+                    // SAFETY: complete validated four-value groups preserve
+                    // alignment; the stable choice list bounds each source row.
+                    unsafe {
+                        input
+                            .as_ptr()
+                            .add(source * cols + column)
+                            .cast::<Float4>()
+                            .read()
+                            .values
+                    }
                 } else {
-                    (0.0, 0.0)
+                    [0.0; 4]
                 };
+                let at = input_base + shared_index(vector / 16, vector % 16 * 2);
                 unsafe {
-                    *tile.add(4096 + shared_index(pair / 32, pair % 32)) =
-                        cuda_device::convert::cvt_f16x2_f32(a, b);
+                    *tile.add(at) = cuda_device::convert::cvt_f16x2_f32(x[0], x[1]);
+                    *tile.add(at + 1) = cuda_device::convert::cvt_f16x2_f32(x[2], x[3]);
                 }
-                pair += 128;
+                vector += 128;
             }
             thread::sync_threads();
             let mut k = 0;
@@ -156,10 +167,10 @@ pub(crate) mod device {
                     let offset = shared_index(warp * 16 + lane % 16, lane / 16 * 4 + k / 2);
                     let a = cuda_device::wmma::ldmatrix_x4(tile.add(offset));
                     let b0 = cuda_device::wmma::ldmatrix_x2(
-                        tile.add(4096 + shared_index(lane % 8, lane / 8 % 2 * 4 + k / 2)),
+                        tile.add(input_base + shared_index(lane % 8, lane / 8 % 2 * 4 + k / 2)),
                     );
                     let b1 = cuda_device::wmma::ldmatrix_x2(
-                        tile.add(4096 + shared_index(8 + lane % 8, lane / 8 % 2 * 4 + k / 2)),
+                        tile.add(input_base + shared_index(8 + lane % 8, lane / 8 % 2 * 4 + k / 2)),
                     );
                     sum0 = cuda_device::wmma::mma_m16n8k16_f32_f16(sum0, a, b0);
                     sum1 = cuda_device::wmma::mma_m16n8k16_f32_f16(sum1, a, b1);

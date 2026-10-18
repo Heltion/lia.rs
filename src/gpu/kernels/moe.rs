@@ -58,40 +58,66 @@ pub(crate) mod device {
 
     #[kernel]
     pub unsafe fn route(logits: &[f32], selected: *mut u32, probabilities: *mut f32) {
-        let token = thread::index_1d().get();
-        if token < logits.len() / 256 {
-            let mut scores = [f32::NEG_INFINITY; 8];
-            let mut indices = [u32::MAX; 8];
-            let mut expert = 0;
-            while expert < 256 {
-                let score = logits[token * 256 + expert];
-                if score > scores[7] {
-                    let mut slot = 7;
-                    while slot > 0 && score > scores[slot - 1] {
-                        scores[slot] = scores[slot - 1];
-                        indices[slot] = indices[slot - 1];
-                        slot -= 1;
-                    }
-                    scores[slot] = score;
-                    indices[slot] = expert as u32;
+        let tid = thread::index_1d().get();
+        let token = tid / 32;
+        let lane = tid % 32;
+        if token >= logits.len() / 256 {
+            return;
+        }
+        let mut values = [f32::NEG_INFINITY; 8];
+        let mut j = 0;
+        while j < 8 {
+            values[j] = logits[token * 256 + lane + j * 32];
+            j += 1;
+        }
+        let mut scores = [0.0f32; 8];
+        let mut sum = 0.0;
+        let mut maximum = 0.0;
+        let mut rank = 0;
+        while rank < 8 {
+            let mut best = f32::NEG_INFINITY;
+            let mut id = u32::MAX;
+            j = 0;
+            while j < 8 {
+                let candidate = (lane + j * 32) as u32;
+                if values[j] > best
+                    || (best != f32::NEG_INFINITY && values[j] == best && candidate < id)
+                {
+                    best = values[j];
+                    id = candidate;
                 }
-                expert += 1;
+                j += 1;
             }
-            let maximum = scores[0];
-            let mut sum = 0.0;
-            let mut i = 0;
-            while i < 8 {
-                scores[i] = (scores[i] - maximum).exp();
-                sum += scores[i];
-                i += 1;
-            }
-            i = 0;
-            while i < 8 {
-                unsafe {
-                    *selected.add(token * 8 + i) = indices[i];
-                    *probabilities.add(token * 8 + i) = scores[i] / sum;
+            let mut delta = 16;
+            while delta > 0 {
+                let other = cuda_device::warp::shuffle_down_f32_sync(0xffff_ffff, best, delta);
+                let other_id = cuda_device::warp::shuffle_down_sync(0xffff_ffff, id, delta);
+                if other > best || (other == best && other_id < id) {
+                    best = other;
+                    id = other_id;
                 }
-                i += 1;
+                delta /= 2;
+            }
+            let winner = cuda_device::warp::shuffle_sync(0xffff_ffff, id, 0);
+            if winner < 256 && winner as usize % 32 == lane {
+                values[winner as usize / 32] = f32::NEG_INFINITY;
+            }
+            if lane == 0 {
+                if rank == 0 {
+                    maximum = best;
+                }
+                scores[rank] = (best - maximum).exp();
+                sum += scores[rank];
+                // SAFETY: each full warp owns eight disjoint routing slots.
+                unsafe { *selected.add(token * 8 + rank) = winner };
+            }
+            rank += 1;
+        }
+        if lane == 0 {
+            rank = 0;
+            while rank < 8 {
+                unsafe { *probabilities.add(token * 8 + rank) = scores[rank] / sum };
+                rank += 1;
             }
         }
     }
@@ -173,50 +199,55 @@ pub(crate) mod device {
         host_scales: *const u16,
         output: *mut f32,
     ) {
+        static mut PARTIALS: cuda_device::SharedArray<f32, 8, 16> =
+            cuda_device::SharedArray::UNINIT;
         let tid = thread::index_1d().get();
-        let row = tid / 32;
+        let row = tid / 256;
         let lane = tid % 32;
-        if row < activated.len() / intermediate / 8 * hidden {
-            let token = row / hidden;
+        let slot = tid % 256 / 32;
+        if row >= activated.len() / intermediate / 8 * hidden {
+            return;
+        }
+        let choice = row / hidden * 8 + slot;
+        let mut sum = 0.0;
+        if selected[choice] < 256 {
+            let expert_row = selected[choice] as usize * hidden + row % hidden;
+            let mut column = lane * 4;
+            while column < intermediate {
+                // SAFETY: validated rows and columns preserve vector alignment.
+                let x = unsafe {
+                    activated
+                        .as_ptr()
+                        .add(choice * intermediate + column)
+                        .cast::<Float4>()
+                        .read()
+                        .values
+                };
+                let index = expert_row * intermediate + column;
+                let (word, scale) =
+                    coefficients::<HOST>(weights, scales, host_weights, host_scales, index);
+                sum = dot4(word, scale, x, sum);
+                column += 128;
+            }
+        } else {
+            sum = f32::NAN;
+        }
+        sum = sum_warp(sum);
+        let partials = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut PARTIALS) };
+        if lane == 0 {
+            unsafe { *partials.add(slot) = sum };
+        }
+        // Each CTA owns one output row and eight expert warps. Merge in the
+        // original routing order, preserving the serial kernel's sum order.
+        thread::sync_threads();
+        if tid % 256 == 0 {
             let mut result = 0.0;
-            let mut choice = token * 8;
-            while choice < (token + 1) * 8 {
-                if selected[choice] >= 256 {
-                    if lane == 0 {
-                        unsafe {
-                            *output.add(row) = f32::NAN;
-                        }
-                    }
-                    return;
-                }
-                let expert_row = selected[choice] as usize * hidden + row % hidden;
-                let mut sum = 0.0;
-                let mut column = lane * 4;
-                while column < intermediate {
-                    // SAFETY: rows and columns preserve16-byte alignment.
-                    let x = unsafe {
-                        activated
-                            .as_ptr()
-                            .add(choice * intermediate + column)
-                            .cast::<Float4>()
-                            .read()
-                            .values
-                    };
-                    let index = expert_row * intermediate + column;
-                    let (word, scale) =
-                        coefficients::<HOST>(weights, scales, host_weights, host_scales, index);
-                    sum = dot4(word, scale, x, sum);
-                    column += 128;
-                }
-                sum = sum_warp(sum);
-                result += sum * probabilities[choice];
-                choice += 1;
+            let mut i = 0;
+            while i < 8 {
+                result += unsafe { *partials.add(i) } * probabilities[row / hidden * 8 + i];
+                i += 1;
             }
-            if lane == 0 {
-                unsafe {
-                    *output.add(row) = result;
-                }
-            }
+            unsafe { *output.add(row) = result };
         }
     }
 

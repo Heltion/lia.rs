@@ -3,6 +3,8 @@ use cuda_core::CudaContext;
 
 mod attention;
 mod basic;
+mod bf16_pair;
+mod bf16_router;
 mod convolution;
 #[cfg(test)]
 mod delta;
@@ -14,6 +16,7 @@ mod delta_tiles;
 #[cfg(test)]
 mod flash;
 mod flash_half;
+mod flash_merge;
 mod flash_mma;
 #[cfg(test)]
 pub(super) mod fp8;
@@ -43,6 +46,8 @@ mod vision_position;
 mod wide_prefill;
 
 pub struct LoadedModule {
+    pub bf16_pair: bf16_pair::device::LoadedModule,
+    pub bf16_router: bf16_router::device::LoadedModule,
     pub gsq: gsq::device::LoadedModule,
     pub gsq_tensor: gsq_tensor::device::LoadedModule,
     pub moe: moe::device::LoadedModule,
@@ -77,6 +82,7 @@ pub struct LoadedModule {
     #[cfg(test)]
     pub flash: flash::device::LoadedModule,
     pub flash_half: flash_half::device::LoadedModule,
+    pub flash_merge: flash_merge::device::LoadedModule,
     pub flash_mma: flash_mma::device::LoadedModule,
     pub attention: attention::device::LoadedModule,
     pub integer: integer::device::LoadedModule,
@@ -89,6 +95,8 @@ pub fn load(context: &std::sync::Arc<CudaContext>) -> anyhow::Result<LoadedModul
     let basic = basic::device::load(context)?;
     let module = basic.as_cuda_module().clone();
     Ok(LoadedModule {
+        bf16_pair: bf16_pair::device::from_module(module.clone())?,
+        bf16_router: bf16_router::device::from_module(module.clone())?,
         gsq: gsq::device::from_module(module.clone())?,
         gsq_tensor: gsq_tensor::device::from_module(module.clone())?,
         moe: moe::device::from_module(module.clone())?,
@@ -123,6 +131,7 @@ pub fn load(context: &std::sync::Arc<CudaContext>) -> anyhow::Result<LoadedModul
         #[cfg(test)]
         flash: flash::device::from_module(module.clone())?,
         flash_half: flash_half::device::from_module(module.clone())?,
+        flash_merge: flash_merge::device::from_module(module.clone())?,
         flash_mma: flash_mma::device::from_module(module.clone())?,
         attention: attention::device::from_module(module.clone())?,
         integer: integer::device::from_module(module.clone())?,

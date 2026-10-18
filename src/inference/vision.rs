@@ -11,6 +11,12 @@ pub(super) struct ImageEmbedding {
 }
 
 impl Engine {
+    pub(super) fn past_image_embeddings(&self, position: usize) -> bool {
+        self.images
+            .iter()
+            .all(|image| position >= image.start + image.data.len() / self.geometry.hidden)
+    }
+
     /// Diagnostic host export; the multimodal forward path can retain the GPU buffer.
     pub fn image_embeddings(&self, image: &PreparedImage) -> Result<Vec<f32>> {
         self.encode_image_buffer(image)?
@@ -109,11 +115,11 @@ impl Engine {
                         attention.cu_deviceptr() as *mut f32,
                     )?;
                 } else {
-                    self.module.vision_flash.tiled_attention(
+                    self.module.vision_flash.tiled_attention::<32>(
                         &self.stream,
                         LaunchConfig {
-                            grid_dim: ((patches.div_ceil(16) * 16) as u32, 1, 1),
-                            block_dim: (128, 1, 1),
+                            grid_dim: ((patches.div_ceil(32) * 16) as u32, 1, 1),
+                            block_dim: (256, 1, 1),
                             shared_mem_bytes: 0,
                         },
                         patches,

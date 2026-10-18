@@ -122,7 +122,7 @@ impl Experts {
             )?;
             module.moe.down::<HOST>(
                 stream,
-                LaunchConfig::for_num_elems((output.len() * 32) as u32),
+                LaunchConfig::for_num_elems((output.len() * 256) as u32),
                 self.hidden,
                 self.intermediate,
                 selected,
@@ -182,7 +182,7 @@ mod tests {
         unsafe {
             module.moe.route(
                 &stream,
-                LaunchConfig::for_num_elems(batch as u32),
+                LaunchConfig::for_num_elems((batch * 32) as u32),
                 &dl,
                 ids.cu_deviceptr() as *mut u32,
                 probabilities.cu_deviceptr() as *mut f32,

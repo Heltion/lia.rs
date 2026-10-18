@@ -1,7 +1,8 @@
-//! Capture GPU-only work; refresh executable parameters before each ordered launch.
+//! Capture GPU-only work and retain bounded decode graphs for repeated launches.
 use super::*;
 use anyhow::Context;
 use cuda_core::sys;
+pub(super) mod replay;
 
 fn check(status: sys::CUresult, operation: &str) -> Result<()> {
     anyhow::ensure!(
@@ -131,6 +132,43 @@ impl Engine {
         let graph = capture.end();
         let value = result?;
         let graph = graph.context("capturing GPU forward execution")?;
+        if key == (1, 1, false, false)
+            && self.geometry.moe
+            && !self.geometry.mtp
+            && self.preallocated
+            && self.past_image_embeddings(self.position - 1)
+            && std::env::var("LIA_DECODE_REPLAY").as_deref() != Ok("0")
+            && self
+                .rotary
+                .borrow()
+                .plan
+                .as_ref()
+                .is_none_or(|p| self.position > p.len())
+        {
+            let hidden = self
+                .last_hidden
+                .as_ref()
+                .context("missing replay hidden state")?
+                .cu_deviceptr();
+            let replay = replay::Replay::new(
+                graph,
+                self._context.clone(),
+                hidden,
+                self.position - 1,
+                attention_plan::plan(
+                    1,
+                    self.position,
+                    self.attention_mma_decode,
+                    self.attention_query_tiles,
+                ),
+            )?;
+            replay.exec.launch(&self.stream)?;
+            *self.decode_replay.borrow_mut() = Some(replay);
+            let mut stats = self.graph_stats.borrow_mut();
+            stats[0] += 1;
+            stats[2] += 1;
+            return Ok(value);
+        }
         let mut cache = self.graphs.borrow_mut();
         let updated = match cache.get_mut(&key) {
             Some(exec) => exec.update(&graph)?,
@@ -151,7 +189,7 @@ impl Engine {
     pub fn cuda_graph_enabled(&self) -> bool {
         self.cuda_graph
     }
-    /// Captures launched, executable updates, and executable instantiations.
+    /// Graph launches, executable updates, and executable instantiations.
     pub fn cuda_graph_stats(&self) -> [u64; 3] {
         *self.graph_stats.borrow()
     }

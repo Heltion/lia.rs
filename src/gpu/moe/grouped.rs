@@ -208,12 +208,14 @@ mod tests {
             clone_matrix(&down),
             128,
         )?;
-        let work = Grouped::new(&stream, 129)?;
-        for batch in [9usize, 33, 129] {
+        let work = Grouped::new(&stream, 257)?;
+        for batch in [9usize, 33, 129, 257] {
             let selected = (0..batch * 8)
                 .map(|i| {
                     if batch < 100 {
                         (i % 8) as u32
+                    } else if batch == 257 {
+                        (248 + i % 8) as u32
                     } else {
                         ((i / 8 * 17 + i % 8 * 31) % 256) as u32
                     }

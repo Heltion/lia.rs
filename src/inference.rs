@@ -103,6 +103,7 @@ pub struct Engine {
     profile: bool,
     preallocated: bool,
     cuda_graph: bool,
+    decode_replay: RefCell<Option<graph::replay::Replay>>,
     graphs: RefCell<BTreeMap<(u8, usize, bool, bool), graph::Executable>>,
     graph_stats: RefCell<[u64; 3]>,
     scratch_reserved: usize,
