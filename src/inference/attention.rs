@@ -213,21 +213,41 @@ impl Engine {
                 } else {
                     attention!(128);
                 }
-                self.module.attention.flash_merge::<256>(
-                    &self.stream,
-                    LaunchConfig::for_num_elems(
-                        (query_count * self.geometry.query_heads * 32) as u32,
-                    ),
-                    query_count * self.geometry.query_heads,
-                    parts,
-                    cap_parts,
-                    query_start * self.geometry.query_heads,
-                    partial,
-                    qgate
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("missing attention query"))?,
-                    attended.cu_deviceptr() as *mut f32,
-                )?;
+                if query_count <= 8 && parts >= 16 {
+                    self.module.flash_merge.flash_merge_columns(
+                        &self.stream,
+                        LaunchConfig {
+                            grid_dim: ((query_count * self.geometry.query_heads) as u32, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        query_count * self.geometry.query_heads,
+                        parts,
+                        cap_parts,
+                        query_start * self.geometry.query_heads,
+                        partial,
+                        qgate
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("missing attention query"))?,
+                        attended.cu_deviceptr() as *mut f32,
+                    )?;
+                } else {
+                    self.module.attention.flash_merge::<256>(
+                        &self.stream,
+                        LaunchConfig::for_num_elems(
+                            (query_count * self.geometry.query_heads * 32) as u32,
+                        ),
+                        query_count * self.geometry.query_heads,
+                        parts,
+                        cap_parts,
+                        query_start * self.geometry.query_heads,
+                        partial,
+                        qgate
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("missing attention query"))?,
+                        attended.cu_deviceptr() as *mut f32,
+                    )?;
+                }
             }
         }
         Ok(Some(

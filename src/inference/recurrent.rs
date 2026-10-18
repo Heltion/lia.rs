@@ -4,15 +4,34 @@ impl Engine {
     pub(super) fn linear_attention(&self, layer: usize, x: &DeviceBuffer<f32>) -> Result<Buffer> {
         let batch = x.len() / self.geometry.hidden;
         let prefix = format!("blk.{layer}");
-        let [qkv, z, alpha, beta] = self.mm_many(
-            [
-                &format!("{prefix}.attn_qkv.weight"),
-                &format!("{prefix}.attn_gate.weight"),
-                &format!("{prefix}.ssm_alpha.weight"),
-                &format!("{prefix}.ssm_beta.weight"),
-            ],
-            x,
-        )?;
+        let [qkv, z, alpha, beta] = if batch > 8 {
+            // Preserve one prepared-input group for all prefill projections.
+            self.mm_many(
+                [
+                    &format!("{prefix}.attn_qkv.weight"),
+                    &format!("{prefix}.attn_gate.weight"),
+                    &format!("{prefix}.ssm_alpha.weight"),
+                    &format!("{prefix}.ssm_beta.weight"),
+                ],
+                x,
+            )?
+        } else {
+            let [qkv, z] = self.mm_many(
+                [
+                    &format!("{prefix}.attn_qkv.weight"),
+                    &format!("{prefix}.attn_gate.weight"),
+                ],
+                x,
+            )?;
+            let [alpha, beta] = self.mm_narrow_pair(
+                [
+                    &format!("{prefix}.ssm_alpha.weight"),
+                    &format!("{prefix}.ssm_beta.weight"),
+                ],
+                x,
+            )?;
+            [qkv, z, alpha, beta]
+        };
         let State::Recurrent {
             conv: history,
             matrix,

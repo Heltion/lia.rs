@@ -77,10 +77,11 @@ mod tests {
                 .collect();
             let input = DeviceBuffer::from_host(&stream, &qkv)?;
             let output = DeviceBuffer::<f32>::zeroed(&stream, tokens * 1152)?;
-            // SAFETY: full warps own distinct query/head output rows; QKV has
-            // tokens complete rows of three 1152-element vectors.
+            let reference = DeviceBuffer::<f32>::zeroed(&stream, tokens * 1152)?;
+            // SAFETY: complete QKV rows, padded query tails, and CTA sizes
+            // matching each tile. Both kernels retain the same FP16 residuals.
             unsafe {
-                module.vision_flash.tiled_attention(
+                module.vision_flash.tiled_attention::<16>(
                     &stream,
                     LaunchConfig {
                         grid_dim: ((tokens.div_ceil(16) * 16) as u32, 1, 1),
@@ -89,9 +90,21 @@ mod tests {
                     },
                     tokens,
                     &input,
+                    reference.cu_deviceptr() as *mut f32,
+                )?;
+                module.vision_flash.tiled_attention::<32>(
+                    &stream,
+                    LaunchConfig {
+                        grid_dim: ((tokens.div_ceil(32) * 16) as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    tokens,
+                    &input,
                     output.cu_deviceptr() as *mut f32,
                 )?;
             }
+            let reference = reference.to_host_vec(&stream)?;
             let actual = output.to_host_vec(&stream)?;
             let scalar = DeviceBuffer::<f32>::zeroed(&stream, tokens * 1152)?;
             // SAFETY: the scalar comparison uses the same complete QKV rows.
@@ -142,6 +155,9 @@ mod tests {
                         } else {
                             3e-5 * (1.0 + expected.abs())
                         };
+                        let prior = reference[query * 1152 + head * 72 + d] as f64;
+                        assert!((prior - expected).abs() < tolerance, "16-query reference");
+                        assert!((value - prior).abs() < tolerance, "query tile agreement");
                         assert!(
                             (value - expected).abs() < tolerance,
                             "tokens={tokens} query={query} head={head} d={d}: {value} != {expected}"

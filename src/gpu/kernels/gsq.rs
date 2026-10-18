@@ -15,7 +15,7 @@ pub(crate) mod device {
 
     /// A warp loads 128 consecutive coefficients with one packed load per lane.
     #[kernel]
-    pub unsafe fn matvec4<const BITS: u32>(
+    pub unsafe fn matvec4<const BITS: u32, const CHANNEL: bool>(
         columns: usize,
         rows: usize,
         batch: usize,
@@ -31,6 +31,13 @@ pub(crate) mod device {
         if group < batch * rows {
             let row = group % rows;
             let token = group / rows;
+            // Channel scales are constant for the complete row, including the
+            // large vocabulary projection. Grouped scales are loaded per vector.
+            let channel_scale = if CHANNEL {
+                unsafe { *scales.get_unchecked(row) }
+            } else {
+                0.0
+            };
             let mut column = lane * 4;
             let mut sum = 0.0f32;
             while column < columns {
@@ -38,9 +45,9 @@ pub(crate) mod device {
                 // SAFETY: host requires complete 128-value groups and aligned
                 // allocations; row/column offsets preserve word/vector alignment.
                 let word = if BITS == 8 {
-                    unsafe { packed.as_ptr().add(index).cast::<u32>().read() }
+                    (unsafe { packed.as_ptr().add(index).cast::<u32>().read() }) ^ 0x80808080
                 } else {
-                    packed[index / 4] as u32
+                    (unsafe { *packed.get_unchecked(index / 4) }) as u32
                 };
                 let x = unsafe {
                     input
@@ -54,12 +61,24 @@ pub(crate) mod device {
                 let mut i = 0;
                 #[unroll]
                 while i < 4 {
-                    let code = ((word >> (i * BITS as usize)) & ((1 << BITS) - 1)) as i32
-                        - (1 << (BITS - 1));
+                    let code = if BITS == 8 {
+                        // Flipping the sign bit converts offset-binary bytes to
+                        // signed i8 exactly, avoiding four scalar subtractions.
+                        ((word >> (i * 8)) as u8 as i8) as i32
+                    } else {
+                        ((word >> (i * 2)) & 3) as i32 - 2
+                    };
                     dot = (code as f32).mul_add(x[i], dot);
                     i += 1;
                 }
-                let scale = scales[row * (columns >> group_shift) + (column >> group_shift)];
+                let scale = if CHANNEL {
+                    channel_scale
+                } else {
+                    unsafe {
+                        *scales
+                            .get_unchecked(row * (columns >> group_shift) + (column >> group_shift))
+                    }
+                };
                 sum = dot.mul_add(scale, sum);
                 column += 128;
             }

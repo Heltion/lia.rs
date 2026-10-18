@@ -57,6 +57,7 @@ impl Engine {
                 self.prefill_batch,
                 self.position,
                 workspace,
+                self.geometry.query_heads,
                 self.attention_mma_decode,
                 self.attention_query_tiles,
             )

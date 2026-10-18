@@ -18,6 +18,7 @@ impl Engine {
         {
             return Err(anyhow!("invalid forward batch or exhausted context"));
         }
+        self.decode_replay.borrow_mut().take();
         self.prepare_tokens(tokens)?;
         let capture = self.begin_graph()?;
         let key = (0, tokens.len(), want_logits, self.capture);
@@ -82,6 +83,7 @@ impl Engine {
         self.step(token, true)
     }
     pub(super) fn step(&mut self, token: u32, want_logits: bool) -> Result<Vec<f32>> {
+        anyhow::ensure!(token < 248320, "invalid vocabulary token");
         if self.position >= self.capacity {
             return Err(anyhow!("context capacity exceeded"));
         }
@@ -89,6 +91,9 @@ impl Engine {
             self.mtp(token, false)?;
         }
         self.mtp_prepared = Some((self.position, token));
+        if self.replay_decode(token, want_logits)? {
+            return Ok(Vec::new());
+        }
         let capture = self.begin_graph()?;
         let result = self.step_device(token, want_logits);
         let output = self.finish_graph(capture, (1, 1, want_logits, self.capture), result)?;

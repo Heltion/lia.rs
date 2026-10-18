@@ -73,24 +73,47 @@ pub(crate) mod device {
                 let row = row_base + vec / 8;
                 let k = (vec % 8) * 8;
                 let dest = shared_index(vec / 8, k / 2);
-                let mut j = 0;
-                while j < 4 {
-                    let (a, b) = if row < rows {
-                        let column = col + k + j * 2;
-                        let index = (row * cols + column) as usize;
-                        let per_byte = 8 / BITS as usize;
-                        let decode = |i: usize| {
-                            let code = (weights[i / per_byte] as u32
-                                >> ((i % per_byte) * BITS as usize))
-                                & ((1 << BITS) - 1);
-                            (code as i32 - (1 << (BITS - 1))) as f32
-                        };
-                        let scale = scales
-                            [(row * (cols >> group_shift) + (column >> group_shift)) as usize];
-                        (decode(index) * scale, decode(index + 1) * scale)
+                // One aligned eight-coefficient load and one scale per group.
+                // Group boundaries are at least 64 values, so this vector never
+                // crosses a scale boundary. Row tails retain zero padding.
+                let (words, scale) = if row < rows {
+                    let index = (row * cols + col + k) as usize;
+                    let words = if BITS == 8 {
+                        let raw = unsafe { weights.as_ptr().add(index).cast::<u64>().read() };
+                        [raw as u32, (raw >> 32) as u32]
                     } else {
-                        (0.0, 0.0)
+                        [
+                            unsafe { weights.as_ptr().add(index / 4).cast::<u16>().read() } as u32,
+                            0,
+                        ]
                     };
+                    let scale = unsafe {
+                        *scales.get_unchecked(
+                            (row * (cols >> group_shift) + ((col + k) >> group_shift)) as usize,
+                        )
+                    };
+                    (words, scale)
+                } else {
+                    ([0, 0], 0.0)
+                };
+                let mut j = 0;
+                #[unroll]
+                while j < 4 {
+                    let (ca, cb) = if BITS == 8 {
+                        let word = words[(j / 2) as usize];
+                        let shift = (j % 2) * 16;
+                        (
+                            ((word >> shift) & 255) as i32 - 128,
+                            ((word >> (shift + 8)) & 255) as i32 - 128,
+                        )
+                    } else {
+                        (
+                            ((words[0] >> (j * 4)) & 3) as i32 - 2,
+                            ((words[0] >> (j * 4 + 2)) & 3) as i32 - 2,
+                        )
+                    };
+                    let a = ca as f32 * scale;
+                    let b = cb as f32 * scale;
                     unsafe {
                         *tile.add(dest + j as usize) = cuda_device::convert::cvt_f16x2_f32(a, b);
                     }

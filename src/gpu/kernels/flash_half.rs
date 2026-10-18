@@ -478,7 +478,7 @@ mod tests {
             "half-cache partitioned attention",
         )?;
         println!("GPU f16 KV cache and partitioned attention match the independent reference");
-        for span in [256, 512, 1024, tokens.div_ceil(32) * 32] {
+        for span in [32, 64, 128, 256, 512, 1024, tokens.div_ceil(32) * 32] {
             let mma_parts = tokens.div_ceil(span);
             for grouped in [false, true] {
                 let mut baseline = None;
