@@ -10,7 +10,7 @@ pub(super) fn from_request(request: &Json) -> Result<Option<Sampling>> {
             .transpose()
             .map(|v| v.unwrap_or(default))
     };
-    let temperature = number("temperature", 0.0)?;
+    let temperature = number("temperature", 1.0)?;
     anyhow::ensure!(
         temperature.is_finite() && temperature >= 0.0,
         "invalid temperature"
@@ -49,7 +49,11 @@ mod tests {
 
     #[test]
     fn sampling_request_validation() -> Result<()> {
-        assert!(from_request(&json!({}))?.is_none());
+        assert_eq!(
+            from_request(&json!({}))?.unwrap().settings(),
+            (1.0, 20, 0.95)
+        );
+        assert!(from_request(&json!({"temperature":0.0}))?.is_none());
         let s =
             from_request(&json!({"temperature":1.0,"top_k":20,"top_p":0.95,"seed":42}))?.unwrap();
         assert_eq!(s.settings(), (1.0, 20, 0.95));

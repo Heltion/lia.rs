@@ -1,6 +1,6 @@
 //! Chunked gated delta updates. Recurrent state and persistent accumulators stay f32.
 use super::delta_mma::{load_state, product, put, scalar, store_state};
-use super::delta_tiles::{BETA, LOWER, PREFIX, RATIO, invert, matrices, prepare};
+use super::delta_tiles::{BETA, LOWER, PREFIX, RATIO, invert, matrices, prepare, prepare_qk};
 use cuda_device::{kernel, thread};
 use cuda_host::cuda_module;
 
@@ -10,13 +10,14 @@ pub(crate) mod device {
     use super::*;
 
     #[kernel]
-    pub unsafe fn delta_chunk(
+    pub unsafe fn delta_chunk<const PREPARED: bool>(
         k_heads: usize,
         v_heads: usize,
         qk: &[f32],
         conv: &[f32],
         decay: &[f32],
         beta: &[f32],
+        prepared: &[u32],
         state: *mut f32,
         out: *mut f32,
     ) {
@@ -56,12 +57,25 @@ pub(crate) mod device {
                 j += 1;
             }
             unsafe {
-                prepare(
-                    tile, q, k, head, k_heads, v_heads, start, valid, local, qk, decay, beta,
-                );
+                if PREPARED {
+                    prepare_qk(q, k, head, k_heads, start, valid, local, qk);
+                    let base = (head * batch.div_ceil(16) + start / 16) * 1072;
+                    let mut i = local;
+                    while i < 1072 {
+                        let dest = if i < 768 { 4352 + i } else { RATIO + i - 768 };
+                        tile.add(dest as usize)
+                            .write(*prepared.get_unchecked((base + i) as usize));
+                        i += 256;
+                    }
+                    thread::sync_threads();
+                } else {
+                    prepare(
+                        tile, q, k, head, k_heads, v_heads, start, valid, local, qk, decay, beta,
+                    );
+                }
             }
             let mut base_output = [0.0f32; 4];
-            if warp < 4 {
+            if warp < 4 && !PREPARED {
                 let col = (warp % 2) * 8;
                 let gram = warp < 2;
                 let x = unsafe {
@@ -107,7 +121,7 @@ pub(crate) mod device {
                         p.fragment(0, col, lane, coefficients);
                     }
                 }
-            } else {
+            } else if warp >= 4 {
                 let col = (warp - 4) * 8;
                 let qs = unsafe {
                     product::<128, false, true>([0.0; 4], q, scratch_state, 0, col, lane)
@@ -145,7 +159,9 @@ pub(crate) mod device {
             }
             thread::sync_threads();
             unsafe {
-                invert(tile, inverse, warp, lane);
+                if !PREPARED {
+                    invert(tile, inverse, warp, lane);
+                }
             }
             thread::sync_threads();
             if warp < 4 {
@@ -236,7 +252,7 @@ mod tests {
         let stream = context.default_stream();
         let module = kernels::load(&context)?;
         let (kh, vh, dim) = (2, 4, 128);
-        for batch in [1, 9, 16, 17, 33, 64, 512] {
+        for batch in [1, 9, 16, 17, 33, 64, 512, 1024, 2048] {
             let qk: Vec<f32> = (0..batch * 2 * kh * dim)
                 .map(|i| ((i * 17 % 37) as f32 - 18.0) * 0.006)
                 .collect();
@@ -290,37 +306,66 @@ mod tests {
             let conv = DeviceBuffer::from_host(&stream, &conv)?;
             let decay = DeviceBuffer::from_host(&stream, &decay)?;
             let beta = DeviceBuffer::from_host(&stream, &beta)?;
-            let state = DeviceBuffer::from_host(&stream, &initial)?;
-            let out = DeviceBuffer::<f32>::zeroed(&stream, batch * vh * dim)?;
-            // SAFETY: one complete256-thread CTA per32-value slice, full
-            //128-wide state rows, and complete padded-input/output extents.
-            unsafe {
-                module.delta_chunk.delta_chunk(
-                    &stream,
-                    LaunchConfig {
-                        grid_dim: ((vh * 4) as u32, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    kh,
-                    vh,
-                    &qk,
-                    &conv,
-                    &decay,
-                    &beta,
-                    state.cu_deviceptr() as *mut f32,
-                    out.cu_deviceptr() as *mut f32,
+            let prepared = DeviceBuffer::<u32>::zeroed(&stream, vh * batch.div_ceil(16) * 1072)?;
+            for parallel in [false, true] {
+                let state = DeviceBuffer::from_host(&stream, &initial)?;
+                let out = DeviceBuffer::<f32>::zeroed(&stream, batch * vh * dim)?;
+                // SAFETY: one complete256-thread CTA per32-value slice, full
+                //128-wide state rows, and complete padded-input/output extents.
+                unsafe {
+                    if parallel {
+                        module.delta_prepare.prepare_chunks(
+                            &stream,
+                            LaunchConfig {
+                                grid_dim: ((vh * batch.div_ceil(16)) as u32, 1, 1),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            kh,
+                            vh,
+                            &qk,
+                            &decay,
+                            &beta,
+                            prepared.cu_deviceptr() as *mut u32,
+                        )?;
+                    }
+                    macro_rules! run {
+                        ($ready:literal) => {
+                            module.delta_chunk.delta_chunk::<$ready>(
+                                &stream,
+                                LaunchConfig {
+                                    grid_dim: ((vh * 4) as u32, 1, 1),
+                                    block_dim: (256, 1, 1),
+                                    shared_mem_bytes: 0,
+                                },
+                                kh,
+                                vh,
+                                &qk,
+                                &conv,
+                                &decay,
+                                &beta,
+                                &prepared,
+                                state.cu_deviceptr() as *mut f32,
+                                out.cu_deviceptr() as *mut f32,
+                            )?
+                        };
+                    }
+                    if parallel {
+                        run!(true);
+                    } else {
+                        run!(false);
+                    }
+                }
+                close(&out.to_host_vec(&stream)?, &expected_out, "chunked outputs")?;
+                close(
+                    &state.to_host_vec(&stream)?,
+                    &expected,
+                    "chunked final state",
                 )?;
+                println!(
+                    "chunk batch={batch} parallel={parallel}: all outputs and final state match independent f64 recurrence"
+                );
             }
-            close(&out.to_host_vec(&stream)?, &expected_out, "chunked outputs")?;
-            close(
-                &state.to_host_vec(&stream)?,
-                &expected,
-                "chunked final state",
-            )?;
-            println!(
-                "chunk batch={batch}: all outputs and final state match independent f64 recurrence"
-            );
         }
         Ok(())
     }

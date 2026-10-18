@@ -533,6 +533,7 @@ dependencies = [
  "cuda-device",
  "cuda-host",
  "fancy-regex",
+ "futures-util",
  "minijinja",
  "minijinja-contrib",
  "serde",

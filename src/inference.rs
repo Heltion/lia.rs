@@ -14,35 +14,20 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-struct Buffer {
-    data: Option<DeviceBuffer<f32>>,
-    pool: Rc<RefCell<BTreeMap<usize, Vec<DeviceBuffer<f32>>>>>,
-}
-impl Deref for Buffer {
-    type Target = DeviceBuffer<f32>;
-    fn deref(&self) -> &Self::Target {
-        self.data.as_ref().expect("live pooled buffer")
-    }
-}
-impl DerefMut for Buffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.data.as_mut().expect("live pooled buffer")
-    }
-}
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        if let Some(data) = self.data.take() {
-            self.pool
-                .borrow_mut()
-                .entry(data.len())
-                .or_default()
-                .push(data);
-        }
-    }
-}
+mod allocation;
+mod attention_plan;
+mod buffer;
+mod graph;
+use buffer::Buffer;
 struct RotaryWork {
     data: DeviceBuffer<f32>,
     key: Option<(usize, usize)>,
+}
+struct Fp8Work {
+    weight_tiles: Option<DeviceBuffer<u32>>,
+    maxima: DeviceBuffer<f32>,
+    scales: DeviceBuffer<f32>,
+    packed: DeviceBuffer<u32>,
 }
 struct QuantWork {
     packed: DeviceBuffer<u32>,
@@ -56,6 +41,7 @@ struct Weight {
     floats: Option<DeviceBuffer<f32>>,
     shape: Vec<usize>,
     kind: u32,
+    fp8_scale: Option<f32>,
     block: usize,
     bytes: usize,
 }
@@ -88,17 +74,32 @@ pub struct Engine {
     last_hidden: Option<Buffer>,
     mtp_prepared: Option<(usize, u32)>,
     profile: bool,
+    preallocated: bool,
+    cuda_graph: bool,
+    graphs: RefCell<BTreeMap<(u8, usize, bool, bool), graph::Executable>>,
+    graph_stats: RefCell<[u64; 3]>,
+    scratch_reserved: usize,
+    token_ids: DeviceBuffer<u32>,
+    zero_hidden: DeviceBuffer<f32>,
+    gdn_prepared: Option<DeviceBuffer<u32>>,
+    greedy_work: BTreeMap<usize, DeviceBuffer<u32>>,
     integer: bool,
     split_k: usize,
     row_group: usize,
     matrix_threads: usize,
+    attention_mma_decode: bool,
+    attention_query_tiles: bool,
     attention_work: RefCell<Option<DeviceBuffer<f32>>>,
+    prefill_tile: usize,
+    prefill_batch: usize,
+    fp8_work: RefCell<Option<Fp8Work>>,
     prefill_input: RefCell<Option<DeviceBuffer<u32>>>,
     quant_work: RefCell<BTreeMap<usize, QuantWork>>,
     sampling_work: RefCell<BTreeMap<usize, SelectionWork>>,
     spec_states: Vec<Option<(DeviceBuffer<f32>, DeviceBuffer<f32>)>>,
     capture: bool,
     max_draft: usize,
+    stochastic_mtp: bool,
     verify_hidden: Option<Buffer>,
     rotary: RefCell<RotaryWork>,
 }
@@ -178,6 +179,7 @@ mod forward;
 mod load;
 mod mtp;
 mod operations;
+mod prefill;
 mod projections;
 mod recurrent;
 mod sampling;

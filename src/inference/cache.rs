@@ -7,11 +7,45 @@ impl Engine {
     }
 
     pub fn trim_scratch(&self) {
-        // Keep small decode buffers, but do not retain large prefill tail
-        // allocations indefinitely across conversations with different shapes.
-        self.pool
-            .borrow_mut()
-            .retain(|elements, _| *elements <= 1024 * 1024);
+        if self.preallocated {
+            return;
+        }
+        let mut pool = self.pool.borrow_mut();
+        let mut available = 64 * 1024 * 1024;
+        for (&elements, buffers) in pool.iter_mut().rev() {
+            let decode = (1..=8).any(|batch| {
+                [1024, 4096, 5120, 6144, 10240, 12288, 17408, 248320]
+                    .iter()
+                    .any(|&width| elements == batch * width)
+            });
+            let count = if elements <= 32768 || decode {
+                buffers.len().min(available / (elements * 4).max(1))
+            } else {
+                0
+            };
+            buffers.truncate(count);
+            available -= count * elements * 4;
+        }
+        pool.retain(|_, buffers| !buffers.is_empty());
+    }
+
+    pub fn attention_mma_min_batch(&self) -> usize {
+        if self.attention_mma_decode { 1 } else { 16 }
+    }
+
+    pub fn fp8_prefill(&self) -> bool {
+        self.fp8_work.borrow().is_some()
+    }
+    pub fn prefill_tile(&self) -> usize {
+        self.prefill_tile
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn stochastic_mtp(&self) -> bool {
+        self.stochastic_mtp
     }
 
     pub fn max_draft(&self) -> usize {
@@ -43,10 +77,7 @@ impl Engine {
         out.copy_from_device_async(input, &self.stream)?;
         Ok(out)
     }
-    pub fn refresh_snapshot(&self, previous: Option<Snapshot>) -> Result<Snapshot> {
-        let Some(mut saved) = previous else {
-            return self.snapshot();
-        };
+    pub fn refresh_snapshot(&self, saved: &mut Snapshot) -> Result<()> {
         for (state, dest) in self.states.iter().zip(&mut saved.recurrent) {
             if let (State::Recurrent { conv, matrix }, Some((dc, dm))) = (state, dest) {
                 dc.copy_from_device_async(conv, &self.stream)?;
@@ -55,12 +86,19 @@ impl Engine {
         }
         match (&self.last_hidden, &mut saved.hidden) {
             (Some(source), Some(dest)) => dest.copy_from_device_async(source, &self.stream)?,
-            (Some(source), None) => saved.hidden = Some(self.copy(source)?),
-            (None, _) => saved.hidden = None,
+            (Some(source), None) => {
+                anyhow::ensure!(
+                    !self.preallocated,
+                    "checkpoint hidden buffer was not reserved"
+                );
+                saved.hidden = Some(self.copy(source)?);
+            }
+            (None, Some(dest)) => dest.zero_async(&self.stream)?,
+            (None, None) => {}
         }
         saved.position = self.position;
         self.stream.synchronize()?;
-        Ok(saved)
+        Ok(())
     }
     pub fn snapshot(&self) -> Result<Snapshot> {
         let mut recurrent = Vec::new();
@@ -106,13 +144,16 @@ impl Engine {
         for state in &mut self.states {
             match state {
                 State::Recurrent { conv, matrix } => {
-                    *conv = DeviceBuffer::zeroed(&self.stream, conv.len())?;
-                    *matrix = DeviceBuffer::zeroed(&self.stream, matrix.len())?;
+                    conv.zero_async(&self.stream)?;
+                    matrix.zero_async(&self.stream)?;
                 }
                 State::Attention { .. } => {}
             }
         }
         self.position = 0;
+        self.rotary.borrow_mut().key = None;
+        self.verify_hidden = None;
+        self.capture = false;
         self.last_hidden = None;
         self.mtp_prepared = None;
         Ok(())

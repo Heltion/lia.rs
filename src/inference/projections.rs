@@ -14,7 +14,7 @@ impl Engine {
         anyhow::ensure!(shape.len() == 2 && shape[0] > 0, "invalid projection shape");
         let cols = shape[0];
         let batch = input.len() / cols;
-        let mut ready = false;
+        let (mut ready, mut fp8_ready) = (false, false);
         let mut outputs: [Option<Buffer>; N] = std::array::from_fn(|_| None);
         for (output, name) in outputs.iter_mut().zip(names) {
             let weight = self.weight(name)?;
@@ -22,10 +22,15 @@ impl Engine {
                 weight.shape.len() == 2 && weight.shape[0] == cols,
                 "projection input width mismatch: {name}"
             );
-            *output = Some(self.mm_prepared(name, input, ready)?);
-            // Large batches always pack f16 activations. Short batches prepare
-            // integer inputs only for quantized weights; F32/BF16 leave them intact.
-            ready |= batch > 8 || (self.integer && weight.kind != 0 && weight.kind != 30);
+            let fp8 = batch >= crate::gpu::WIDE_MIN_BATCH && weight.fp8_scale.is_some();
+            *output = Some(self.mm_prepared(name, input, if fp8 { fp8_ready } else { ready })?);
+            // Reuse is tracked separately for FP8 and the existing representation.
+            // Short F32/BF16 projections leave integer activations untouched.
+            if fp8 {
+                fp8_ready = true;
+            } else {
+                ready |= batch > 8 || (self.integer && weight.kind != 0 && weight.kind != 30);
+            }
         }
         Ok(outputs.map(|output| output.expect("all projections initialized")))
     }

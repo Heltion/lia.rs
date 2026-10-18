@@ -252,3 +252,6 @@ mod packed;
 pub use packed::packed_eight;
 #[cfg(feature = "cuda")]
 pub use packed::packed_eight_aligned;
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) mod fp8;

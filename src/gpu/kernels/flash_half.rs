@@ -331,20 +331,22 @@ mod tests {
 
     #[test]
     fn partitioned_attention() -> Result<()> {
-        check::<64>(65, 2)?;
-        check::<128>(129, 2)?;
-        check::<64>(513, 17)?;
-        check::<128>(513, 33)?;
-        check::<128>(33, 33)
+        check::<64>(65, 2, 4, 2)?;
+        check::<128>(129, 2, 4, 2)?;
+        check::<64>(513, 17, 4, 2)?;
+        check::<128>(513, 33, 4, 2)?;
+        check::<64>(2049, 1, 24, 4)?;
+        check::<64>(2049, 4, 24, 4)?;
+        check::<128>(513, 17, 24, 4)?;
+        check::<128>(1025, 129, 4, 2)?;
+        check::<128>(33, 33, 4, 2)
     }
 
-    fn check<const TILE: usize>(tokens: usize, batch: usize) -> Result<()> {
+    fn check<const TILE: usize>(tokens: usize, batch: usize, qh: usize, kvh: usize) -> Result<()> {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
         let dim = 256;
-        let qh = 4;
-        let kvh = 2;
         let parts = tokens.div_ceil(TILE);
         let cap = parts + 1;
         let q: Vec<f32> = (0..batch * qh * dim)
@@ -415,6 +417,7 @@ mod tests {
                 batch * qh,
                 parts,
                 cap,
+                0,
                 &partial,
                 &dg,
                 out.cu_deviceptr() as *mut f32,
@@ -461,6 +464,7 @@ mod tests {
                 batch * qh,
                 parts,
                 cap,
+                0,
                 &partial,
                 &dg,
                 out.cu_deviceptr() as *mut f32,
@@ -472,44 +476,83 @@ mod tests {
             "half-cache partitioned attention",
         )?;
         println!("GPU f16 KV cache and partitioned attention match the independent reference");
-        let mma_parts = tokens.div_ceil(256);
-        let mma_partial = DeviceBuffer::<f32>::zeroed(&stream, batch * qh * mma_parts * 258)?;
-        // SAFETY: full CTAs, matching GQA dimensions, padded query tails, and
-        // exactly one partition slot per query/head/256-token context segment.
-        unsafe {
-            module.flash_mma.flash_mma(
-                &stream,
-                LaunchConfig {
-                    grid_dim: ((batch.div_ceil(16) * qh * mma_parts) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                qh,
-                kvh,
-                tokens,
-                mma_parts,
-                &dq,
-                &k16,
-                &v16,
-                mma_partial.cu_deviceptr() as *mut f32,
-            )?;
-            module.attention.flash_merge::<256>(
-                &stream,
-                LaunchConfig::for_num_elems((batch * qh * 32) as u32),
-                batch * qh,
-                mma_parts,
-                mma_parts,
-                &mma_partial,
-                &dg,
-                out.cu_deviceptr() as *mut f32,
-            )?;
+        for span in [256, 512, 1024, tokens.div_ceil(32) * 32] {
+            let mma_parts = tokens.div_ceil(span);
+            for grouped in [false, true] {
+                let mut baseline = None;
+                for stride in [batch, 16] {
+                    let mma_partial = DeviceBuffer::<f32>::zeroed(
+                        &stream,
+                        batch.min(stride) * qh * mma_parts * 258,
+                    )?;
+                    for query_start in (0..batch).step_by(stride) {
+                        let query_count = (batch - query_start).min(stride);
+                        let heads = if grouped { kvh } else { qh };
+                        let queries = query_count * if grouped { qh / kvh } else { 1 };
+                        let config = LaunchConfig {
+                            grid_dim: ((queries.div_ceil(16) * heads * mma_parts) as u32, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        // SAFETY: independent complete causal queries, matching GQA grouping and disjoint output slots.
+                        unsafe {
+                            if grouped {
+                                module.flash_mma.flash_mma::<true>(
+                                    &stream,
+                                    config,
+                                    qh,
+                                    kvh,
+                                    tokens,
+                                    span,
+                                    mma_parts,
+                                    query_start,
+                                    &dq,
+                                    &k16,
+                                    &v16,
+                                    mma_partial.cu_deviceptr() as *mut f32,
+                                )?;
+                            } else {
+                                module.flash_mma.flash_mma::<false>(
+                                    &stream,
+                                    config,
+                                    qh,
+                                    kvh,
+                                    tokens,
+                                    span,
+                                    mma_parts,
+                                    query_start,
+                                    &dq,
+                                    &k16,
+                                    &v16,
+                                    mma_partial.cu_deviceptr() as *mut f32,
+                                )?;
+                            }
+                            module.attention.flash_merge::<256>(
+                                &stream,
+                                LaunchConfig::for_num_elems((query_count * qh * 32) as u32),
+                                query_count * qh,
+                                mma_parts,
+                                mma_parts,
+                                query_start * qh,
+                                &mma_partial,
+                                &dg,
+                                out.cu_deviceptr() as *mut f32,
+                            )?;
+                        }
+                    }
+                    let actual = out.to_host_vec(&stream)?;
+                    if let Some(previous) = &baseline {
+                        assert_eq!(
+                            &actual, previous,
+                            "query tiles change attention: batch={batch}, grouped={grouped}, span={span}"
+                        );
+                    } else {
+                        baseline = Some(actual.clone());
+                    }
+                    close(&actual, &expected, "Tensor Core grouped causal attention")?;
+                }
+            }
         }
-        close(
-            &out.to_host_vec(&stream)?,
-            &expected,
-            "Tensor Core causal attention",
-        )?;
-        println!("Tensor Core attention: batch={batch} tokens={tokens} matches independent f64");
         Ok(())
     }
 }

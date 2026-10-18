@@ -86,7 +86,12 @@ pub fn render(model: &Model, request: &Json) -> Result<String> {
         let f=&tool["function"];
         json!({"type":"function","function":{"name":f["name"],"description":f.get("description").cloned().unwrap_or(json!("")),"parameters":f["parameters"]}})
     }).collect();
-    let mut context = json!({"messages": messages,"tools":tools,"add_generation_prompt":true,"enable_thinking":true,"reasoning_effort":"medium","preserve_reasoning":true});
+    for message in messages.as_array_mut().unwrap() {
+        if message["role"] == "developer" {
+            message["role"] = json!("system");
+        }
+    }
+    let mut context = json!({"messages": messages,"tools":tools,"add_generation_prompt":true,"enable_thinking":true,"reasoning_effort":request.get("reasoning_effort").cloned().unwrap_or(json!("xhigh")),"preserve_reasoning":true});
     if let Some(kwargs) = request.get("chat_template_kwargs") {
         for (k, v) in kwargs
             .as_object()

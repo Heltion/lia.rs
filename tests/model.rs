@@ -16,6 +16,8 @@ fn batched_forward_and_native_mtp_match_greedy() -> Result<()> {
         engine.forward(next)?;
     }
     engine.reset()?;
+    assert!(engine.forward_many(&[248320], false).is_err());
+    engine.reset()?;
     let mut prefix = vec![initial];
     prefix.extend_from_slice(&expected[..expected.len() - 1]);
     let logits = engine.forward_many(&prefix, true)?;
@@ -45,6 +47,11 @@ fn batched_forward_and_native_mtp_match_greedy() -> Result<()> {
     engine.synchronize()?;
     assert_eq!(actual, expected, "native MTP differs from greedy");
     assert!(proposed > 0 && accepted > 0 && accepted < proposed);
+    if engine.cuda_graph_enabled() {
+        let [launches, updates, instantiations] = engine.cuda_graph_stats();
+        assert!(launches > 0 && updates > 0 && instantiations > 0);
+        assert_eq!(launches, updates + instantiations);
+    }
     Ok(())
 }
 
@@ -105,5 +112,89 @@ fn sampled_native_mtp_matches_single_token_sampling() -> Result<()> {
         "sample-and-match changed the target random stream"
     );
     assert!(proposed > 0 && accepted <= proposed);
+    if engine.cuda_graph_enabled() {
+        let [launches, updates, instantiations] = engine.cuda_graph_stats();
+        assert!(launches > 0 && updates > 0 && instantiations > 0);
+        assert_eq!(launches, updates + instantiations);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires LIA_TEST_MODEL and a CUDA device"]
+fn stochastic_native_mtp_preserves_degenerate_target_and_rollback() -> Result<()> {
+    use lia::sampling::Sampling;
+    let path = std::env::var("LIA_TEST_MODEL")?;
+    let mut engine = Engine::load(&path, 64)?;
+    let mut expected = Vec::new();
+    engine.forward(109266)?;
+    for _ in 0..8 {
+        let token = engine.current_token()?;
+        expected.push(token);
+        engine.forward(token)?;
+    }
+    engine.reset()?;
+    engine.forward_many(&[109266], false)?;
+    let mut target = Sampling::new(1.0, 1, 1.0, 42)?;
+    let mut draft = Sampling::new(1.0, 1, 1.0, 42 ^ 0x85ebca6b)?;
+    let mut first = engine.current_sample(&mut target)?;
+    let mut actual = Vec::new();
+    let (mut proposed, mut accepted) = (0, 0);
+    while actual.len() < expected.len() {
+        let (tokens, next, n, a) = engine.speculate_stochastic(
+            first,
+            expected.len() - actual.len(),
+            248046,
+            &mut target,
+            &mut draft,
+        )?;
+        actual.extend(tokens);
+        first = next;
+        proposed += n;
+        accepted += a;
+    }
+    engine.synchronize()?;
+    assert_eq!(actual, expected);
+    assert!(
+        accepted > 0 && accepted < proposed,
+        "must exercise acceptance and rollback"
+    );
+    if engine.cuda_graph_enabled() {
+        let [launches, updates, instantiations] = engine.cuda_graph_stats();
+        assert!(launches > 0 && updates > 0 && instantiations > 0);
+        assert_eq!(launches, updates + instantiations);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires LIA_TEST_MODEL and a CUDA device"]
+fn prefill_workspace_and_reset_are_deterministic() -> Result<()> {
+    let path = std::env::var("LIA_TEST_MODEL")?;
+    let mut engine = Engine::load(&path, 1024)?;
+    let configured = std::env::var("LIA_PREFILL_FP8").as_deref() == Ok("1");
+    assert_eq!(engine.fp8_prefill(), configured);
+    let prefix = vec![109266; 513];
+    engine.forward_many(&prefix, false)?;
+    let token = engine.current_token()?;
+    let expected = engine.forward(token)?;
+    assert!(expected.iter().all(|x| x.is_finite()));
+    engine.reset()?;
+    assert!(engine.forward_many(&[248320], false).is_err());
+    engine.reset()?;
+    engine.forward_many(&prefix, false)?;
+    assert_eq!(engine.current_token()?, token);
+    let actual = engine.forward(token)?;
+    assert_eq!(
+        actual, expected,
+        "large prefill workspace/reset changes logits"
+    );
+    if engine.cuda_graph_enabled() {
+        assert!(engine.cuda_graph_stats()[0] > 0);
+    }
+    println!(
+        "large prefill and recovery verified; FP8={configured}, weight_workspace_bytes={}",
+        engine.fp8_weight_workspace_bytes()
+    );
     Ok(())
 }

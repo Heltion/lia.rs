@@ -1,6 +1,9 @@
 //! Seeded top-k/nucleus sampling and causal sample-and-match verification.
 use anyhow::{Result, anyhow, ensure};
 
+mod random;
+mod speculative;
+
 pub struct Distribution {
     entries: Vec<(u32, f64)>,
 }
@@ -9,7 +12,8 @@ pub struct Sampling {
     temperature: f64,
     top_k: usize,
     top_p: f64,
-    state: u64,
+    random: random::Random,
+    verification_random: random::Random,
 }
 
 impl Sampling {
@@ -30,7 +34,8 @@ impl Sampling {
             temperature,
             top_k,
             top_p,
-            state: seed,
+            random: random::Random::new(seed as u32),
+            verification_random: random::Random::new(seed as u32),
         })
     }
 
@@ -85,16 +90,13 @@ impl Sampling {
     }
 
     fn uniform(&mut self) -> f64 {
-        // SplitMix64: deterministic across platforms, with 53 random fraction bits.
-        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
-        let mut x = self.state;
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-        x ^= x >> 31;
-        (x >> 11) as f64 / 9007199254740992.0
+        self.random.uniform()
     }
 
     pub fn draw(&mut self, distribution: &Distribution) -> u32 {
+        if distribution.entries.len() == 1 {
+            return distribution.entries[0].0;
+        }
         let sample = self.uniform();
         distribution.at(sample)
     }

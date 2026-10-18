@@ -16,7 +16,7 @@ impl Engine {
         ))
     }
 
-    fn distributions(
+    pub(super) fn distributions(
         &self,
         logits: &DeviceBuffer<f32>,
         sampling: &Sampling,
@@ -32,6 +32,10 @@ impl Engine {
         let required = batch * slots;
         let mut workspace = self.sampling_work.borrow_mut();
         if let std::collections::btree_map::Entry::Vacant(entry) = workspace.entry(batch) {
+            anyhow::ensure!(
+                !self.preallocated,
+                "sampling batch exceeds reserved workspace"
+            );
             entry.insert(SelectionWork {
                 candidates: DeviceBuffer::zeroed(&self.stream, required)?,
             });
