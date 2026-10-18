@@ -17,8 +17,15 @@ use std::{
 mod allocation;
 mod attention_plan;
 mod buffer;
+mod geometry;
 mod graph;
+mod gsq;
+mod huggingface;
+mod initialize;
+mod moe;
+mod penalty;
 use buffer::Buffer;
+use geometry::Geometry;
 struct RotaryWork {
     data: DeviceBuffer<f32>,
     key: Option<(usize, usize)>,
@@ -39,6 +46,7 @@ struct SelectionWork {
     candidates: DeviceBuffer<u64>,
 }
 struct Weight {
+    group: Option<GroupScale>,
     data: DeviceBuffer<u8>,
     floats: Option<DeviceBuffer<f32>>,
     shape: Vec<usize>,
@@ -46,6 +54,16 @@ struct Weight {
     fp8_scale: Option<f32>,
     block: usize,
     bytes: usize,
+}
+struct GroupScale {
+    bits: u32,
+    size: usize,
+    scales: DeviceBuffer<f32>,
+}
+struct RoutingWork {
+    grouped: crate::gpu::moe::Grouped,
+    selected: DeviceBuffer<u32>,
+    probabilities: DeviceBuffer<f32>,
 }
 enum State {
     Recurrent {
@@ -65,6 +83,11 @@ pub struct Snapshot {
     images: Vec<Rc<vision::ImageEmbedding>>,
 }
 pub struct Engine {
+    geometry: Geometry,
+    experts: BTreeMap<usize, crate::gpu::moe::Experts>,
+    routing: Option<RoutingWork>,
+    presence: Option<DeviceBuffer<f32>>,
+    presence_strength: f32,
     _context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     module: kernels::LoadedModule,

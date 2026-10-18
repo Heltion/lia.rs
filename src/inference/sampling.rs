@@ -21,6 +21,8 @@ impl Engine {
         logits: &DeviceBuffer<f32>,
         sampling: &Sampling,
     ) -> Result<Vec<Distribution>> {
+        let adjusted = self.adjusted_logits(logits)?;
+        let logits = adjusted.as_deref().unwrap_or(logits);
         const VOCAB: usize = 248320;
         anyhow::ensure!(
             !logits.is_empty() && logits.len().is_multiple_of(VOCAB),

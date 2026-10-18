@@ -66,15 +66,21 @@ impl Engine {
                 self.attention_query_tiles,
             )
         };
+        // Non-speculative execution does not need draft/verification headroom.
+        let reserve = if self.geometry.mtp {
+            RESERVE
+        } else {
+            128 * MIB
+        };
         let maximum = self.prefill_batch.min(self.capacity);
         let batch = [4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 1]
             .into_iter()
             .filter(|&n| n <= maximum)
             .find(|&n| {
                 let (scratch, attention, packed) = reservation(n, attention_bytes(n));
-                scratch + attention + packed + RESERVE <= free
+                scratch + attention + packed + reserve <= free
             })
-            .ok_or_else(|| anyhow!("insufficient CUDA headroom to reserve inference buffers"))?;
+            .ok_or_else(|| anyhow!("insufficient CUDA headroom to reserve inference buffers: free={free}, reserve={reserve}"))?;
         let (scratch, attention, packed) = reservation(batch, attention_bytes(batch));
         {
             let mut pool = self.pool.borrow_mut();
@@ -134,7 +140,7 @@ impl Engine {
     pub(crate) fn prepare_checkpoint(&self) -> Result<Snapshot> {
         let mut checkpoint = self.snapshot()?;
         if checkpoint.hidden.is_none() {
-            checkpoint.hidden = Some(DeviceBuffer::zeroed(&self.stream, 5120)?);
+            checkpoint.hidden = Some(DeviceBuffer::zeroed(&self.stream, self.geometry.hidden)?);
         }
         Ok(checkpoint)
     }

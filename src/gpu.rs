@@ -13,6 +13,9 @@ pub(crate) const MAX_PREFILL_BATCH: usize = 4096;
 
 pub(crate) mod fp8;
 pub(crate) mod fp8_cache;
+pub(crate) mod gsq;
+pub(crate) mod gsq_tensor;
+pub(crate) mod moe;
 mod tensor;
 pub(crate) use tensor::launch_prefill_matrix;
 pub(crate) use tensor::{MEDIUM_MIN_BATCH, WIDE_MIN_BATCH};

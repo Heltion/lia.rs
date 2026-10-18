@@ -27,8 +27,12 @@ impl Engine {
     fn forward_many_inner(&mut self, tokens: &[u32], want_logits: bool) -> Result<Option<Buffer>> {
         let batch = tokens.len();
         let mut hidden = self.embed_many(tokens)?;
-        for layer in 0..64 {
-            let normalized = self.norm(&format!("blk.{layer}.attn_norm.weight"), &hidden, 5120)?;
+        for layer in 0..self.geometry.layers {
+            let normalized = self.norm(
+                &format!("blk.{layer}.attn_norm.weight"),
+                &hidden,
+                self.geometry.hidden,
+            )?;
             let attention = if (layer + 1) % 4 == 0 {
                 self.full_attention(layer, &normalized)?
             } else {
@@ -41,23 +45,13 @@ impl Engine {
             let normalized = self.norm(
                 &format!("blk.{layer}.post_attention_norm.weight"),
                 &residual,
-                5120,
+                self.geometry.hidden,
             )?;
-            let [up, gate] = self.mm_many(
-                [
-                    &format!("blk.{layer}.ffn_up.weight"),
-                    &format!("blk.{layer}.ffn_gate.weight"),
-                ],
-                &normalized,
-            )?;
-            let activated = self.activate_owned(up, &gate)?;
-            drop(gate);
+            let down = self.feed_forward(layer, &normalized)?;
             drop(normalized);
-            let down = self.mm(&format!("blk.{layer}.ffn_down.weight"), &activated)?;
-            drop(activated);
             hidden = self.add(&residual, &down)?;
         }
-        let normalized = self.norm("output_norm.weight", &hidden, 5120)?;
+        let normalized = self.norm("output_norm.weight", &hidden, self.geometry.hidden)?;
         drop(hidden);
         let logits = if want_logits {
             Some(self.mm("output.weight", &normalized)?)
@@ -65,13 +59,13 @@ impl Engine {
             None
         };
         self.mtp_many(tokens, &normalized)?;
-        let mut last = self.zeros(5120)?;
+        let mut last = self.zeros(self.geometry.hidden)?;
         // SAFETY: a complete final token row is copied to a fresh hidden buffer.
         unsafe {
             self.module.basic.last_hidden(
                 &self.stream,
-                LaunchConfig::for_num_elems(5120),
-                5120,
+                LaunchConfig::for_num_elems(self.geometry.hidden as u32),
+                self.geometry.hidden,
                 &normalized,
                 &mut last,
             )?;
@@ -91,7 +85,7 @@ impl Engine {
         if self.position >= self.capacity {
             return Err(anyhow!("context capacity exceeded"));
         }
-        if self.mtp_prepared != Some((self.position, token)) {
+        if self.geometry.mtp && self.mtp_prepared != Some((self.position, token)) {
             self.mtp(token, false)?;
         }
         self.mtp_prepared = Some((self.position, token));
@@ -110,8 +104,12 @@ impl Engine {
     }
     fn step_device(&mut self, token: u32, want_logits: bool) -> Result<Option<Buffer>> {
         let mut hidden = self.embed(token)?;
-        for layer in 0..64 {
-            let normalized = self.norm(&format!("blk.{layer}.attn_norm.weight"), &hidden, 5120)?;
+        for layer in 0..self.geometry.layers {
+            let normalized = self.norm(
+                &format!("blk.{layer}.attn_norm.weight"),
+                &hidden,
+                self.geometry.hidden,
+            )?;
             let attention = if (layer + 1) % 4 == 0 {
                 self.full_attention(layer, &normalized)?
             } else {
@@ -124,23 +122,13 @@ impl Engine {
             let normalized = self.norm(
                 &format!("blk.{layer}.post_attention_norm.weight"),
                 &residual,
-                5120,
+                self.geometry.hidden,
             )?;
-            let [up, gate] = self.mm_many(
-                [
-                    &format!("blk.{layer}.ffn_up.weight"),
-                    &format!("blk.{layer}.ffn_gate.weight"),
-                ],
-                &normalized,
-            )?;
-            let activated = self.activate_owned(up, &gate)?;
-            drop(gate);
+            let down = self.feed_forward(layer, &normalized)?;
             drop(normalized);
-            let down = self.mm(&format!("blk.{layer}.ffn_down.weight"), &activated)?;
-            drop(activated);
             hidden = self.add(&residual, &down)?;
         }
-        let normalized = self.norm("output_norm.weight", &hidden, 5120)?;
+        let normalized = self.norm("output_norm.weight", &hidden, self.geometry.hidden)?;
         drop(hidden);
         let logits = if want_logits {
             Some(self.mm("output.weight", &normalized)?)

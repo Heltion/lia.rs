@@ -102,6 +102,7 @@ impl Engine {
             weights.insert(
                 tensor.name.clone(),
                 Weight {
+                    group: None,
                     data,
                     floats,
                     shape: tensor.shape.iter().map(|x| *x as usize).collect(),
@@ -124,134 +125,18 @@ impl Engine {
                 },
             );
         }
-        let mut states = Vec::new();
-        for layer in 0..65 {
-            states.push(if layer == 64 || (layer + 1) % 4 == 0 {
-                State::Attention {
-                    k: DeviceBuffer::zeroed(&stream, capacity * 1024)?,
-                    v: DeviceBuffer::zeroed(&stream, capacity * 1024)?,
-                }
-            } else {
-                State::Recurrent {
-                    conv: DeviceBuffer::zeroed(&stream, 3 * 10240)?,
-                    matrix: DeviceBuffer::zeroed(&stream, 48 * 128 * 128)?,
-                }
-            });
-        }
-        stream.synchronize()?;
-        let rotary = RefCell::new(RotaryWork {
-            data: DeviceBuffer::zeroed(&stream, crate::gpu::MAX_PREFILL_BATCH * 64)?,
-            key: None,
-            positions: DeviceBuffer::zeroed(&stream, capacity * 4)?,
-            plan: None,
-        });
-        let token_ids = DeviceBuffer::zeroed(&stream, crate::gpu::MAX_PREFILL_BATCH)?;
-        let zero_hidden = DeviceBuffer::zeroed(&stream, 5120)?;
-        let mut engine = Self {
-            _context: context,
+        let mut engine = Self::initialize(
+            context,
             stream,
             module,
             weights,
-            states,
-            position: 0,
             capacity,
+            Geometry::dense(),
             eps,
             rope_base,
-            pool: Rc::new(RefCell::new(BTreeMap::new())),
-            last_hidden: None,
-            mtp_prepared: None,
-            profile: std::env::var_os("LIA_PROFILE").is_some(),
-            integer: std::env::var("LIA_INT8").as_deref().unwrap_or("1") != "0",
-            split_k: std::env::var("LIA_SPLIT_K")
-                .unwrap_or_else(|_| "1".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n == 1 || *n == 4)
-                .ok_or_else(|| anyhow!("LIA_SPLIT_K must be 1 or 4"))?,
-            row_group: std::env::var("LIA_MM_ROWS")
-                .unwrap_or_else(|_| "2".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n == 1 || *n == 2)
-                .ok_or_else(|| anyhow!("LIA_MM_ROWS must be 1 or 2"))?,
-            matrix_threads: std::env::var("LIA_MM_THREADS")
-                .unwrap_or_else(|_| "128".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|n| [64, 128].contains(n))
-                .ok_or_else(|| anyhow!("LIA_MM_THREADS must be 64, 128 or 256"))?,
-            attention_mma_decode: std::env::var("LIA_ATTN_MMA_DECODE").as_deref() == Ok("1"),
-            attention_query_tiles: std::env::var("LIA_ATTN_QUERY_TILES").as_deref() == Ok("1"),
-            attention_work: RefCell::new(None),
-            prefill_batch: std::env::var("LIA_PREFILL_BATCH")
-                .unwrap_or_else(|_| "512".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|batch| [128, 256, 512, 1024, 2048, 4096].contains(batch))
-                .ok_or_else(|| {
-                    anyhow!("LIA_PREFILL_BATCH must be 128, 256, 512, 1024, 2048, or 4096")
-                })?,
-            prefill_tile: std::env::var("LIA_PREFILL_TILE")
-                .unwrap_or_else(|_| "128".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|tile| [64, 128].contains(tile))
-                .ok_or_else(|| anyhow!("LIA_PREFILL_TILE must be 64 or 128"))?,
-            fp8_work: RefCell::new(None),
-            prefill_input: RefCell::new(None),
-            preallocated: cuda_graph || std::env::var("LIA_PREALLOCATE").as_deref() == Ok("1"),
+            fp8_prefill,
             cuda_graph,
-            graphs: RefCell::new(BTreeMap::new()),
-            graph_stats: RefCell::new([0; 3]),
-            scratch_reserved: 0,
-            token_ids,
-            zero_hidden,
-            gdn_prepared: None,
-            greedy_work: BTreeMap::new(),
-            quant_work: RefCell::new(BTreeMap::new()),
-            sampling_work: RefCell::new(BTreeMap::new()),
-            spec_states: Vec::new(),
-            capture: false,
-            max_draft: std::env::var("LIA_MTP_DRAFT_MAX")
-                .unwrap_or_else(|_| "3".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|n| (1..=7).contains(n))
-                .ok_or_else(|| anyhow!("LIA_MTP_DRAFT_MAX must be between 1 and 7"))?,
-            stochastic_mtp: match std::env::var("LIA_MTP_SAMPLING")
-                .as_deref()
-                .unwrap_or("match")
-            {
-                "match" => false,
-                "stochastic" => true,
-                _ => return Err(anyhow!("LIA_MTP_SAMPLING must be match or stochastic")),
-            },
-            verify_hidden: None,
-            rotary,
-            vision_eps: None,
-            images: Vec::new(),
-        };
-        engine.prepare_speculation_buffers()?;
-        engine.prepare_small_workspaces()?;
-        if std::env::var("LIA_GDN_PARALLEL").as_deref() == Ok("1") {
-            engine.gdn_prepared = Some(DeviceBuffer::zeroed(
-                &engine.stream,
-                48 * crate::gpu::MAX_PREFILL_BATCH.div_ceil(16) * 1072,
-            )?);
-        }
-        if fp8_prefill {
-            let elements = 17408 * engine.prefill_batch.min(crate::gpu::MAX_PREFILL_BATCH);
-            *engine.fp8_work.borrow_mut() = Some(Fp8Work {
-                weight_tiles: if std::env::var("LIA_PREFILL_WEIGHT_PREPACK").as_deref() == Ok("1") {
-                    Some(DeviceBuffer::zeroed(&engine.stream, 17408 * 5120 / 4)?)
-                } else {
-                    None
-                },
-                packed: DeviceBuffer::zeroed(&engine.stream, elements.div_ceil(4))?,
-                maxima: DeviceBuffer::zeroed(&engine.stream, elements.div_ceil(1024))?,
-                scales: DeviceBuffer::zeroed(&engine.stream, 2)?,
-            });
-        }
+        )?;
         if let Some(path) = projector {
             engine.load_vision(path)?;
         }

@@ -41,14 +41,9 @@ fn image_sources(request: &Json) -> Result<Vec<String>> {
 }
 
 impl Session {
-    pub(super) fn prepare_prompt(
-        &self,
-        model: &Model,
-        tokenizer: &Tokenizer,
-        request: &Json,
-    ) -> Result<Prompt> {
+    pub(super) fn prepare_prompt(&self, tokenizer: &Tokenizer, request: &Json) -> Result<Prompt> {
         let sources = image_sources(request)?;
-        let text = crate::chat::render(model, request)?;
+        let text = crate::chat::render_template(&self.template, request)?;
         let tokens = tokenizer.encode(&text, true)?;
         if sources.is_empty() {
             return Ok(Prompt {

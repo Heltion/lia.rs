@@ -20,10 +20,16 @@ pub(super) mod fp8;
 mod fp8_matmul;
 mod fp8_prepare;
 mod fp8_weights;
+mod gsq;
+mod gsq_tensor;
 pub(super) mod integer;
 pub(crate) mod matrix;
+mod moe;
+mod moe_grouping;
+mod moe_tensor;
 mod normalization;
 mod packed_prefill;
+mod penalty;
 mod position_table;
 mod rotary;
 mod selection;
@@ -31,14 +37,22 @@ mod tensor;
 mod topk;
 mod vision;
 mod vision_attention;
+mod vision_flash;
 mod vision_math;
 mod vision_position;
 mod wide_prefill;
 
 pub struct LoadedModule {
+    pub gsq: gsq::device::LoadedModule,
+    pub gsq_tensor: gsq_tensor::device::LoadedModule,
+    pub moe: moe::device::LoadedModule,
+    pub moe_grouping: moe_grouping::device::LoadedModule,
+    pub moe_tensor: moe_tensor::device::LoadedModule,
+    pub penalty: penalty::device::LoadedModule,
     pub position_table: position_table::device::LoadedModule,
     pub vision: vision::device::LoadedModule,
     pub vision_math: vision_math::device::LoadedModule,
+    pub vision_flash: vision_flash::device::LoadedModule,
     pub vision_attention: vision_attention::device::LoadedModule,
     pub vision_position: vision_position::device::LoadedModule,
     #[cfg(test)]
@@ -75,9 +89,16 @@ pub fn load(context: &std::sync::Arc<CudaContext>) -> anyhow::Result<LoadedModul
     let basic = basic::device::load(context)?;
     let module = basic.as_cuda_module().clone();
     Ok(LoadedModule {
+        gsq: gsq::device::from_module(module.clone())?,
+        gsq_tensor: gsq_tensor::device::from_module(module.clone())?,
+        moe: moe::device::from_module(module.clone())?,
+        moe_grouping: moe_grouping::device::from_module(module.clone())?,
+        moe_tensor: moe_tensor::device::from_module(module.clone())?,
+        penalty: penalty::device::from_module(module.clone())?,
         position_table: position_table::device::from_module(module.clone())?,
         vision: vision::device::from_module(module.clone())?,
         vision_math: vision_math::device::from_module(module.clone())?,
+        vision_flash: vision_flash::device::from_module(module.clone())?,
         vision_attention: vision_attention::device::from_module(module.clone())?,
         vision_position: vision_position::device::from_module(module.clone())?,
         #[cfg(test)]

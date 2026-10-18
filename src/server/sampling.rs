@@ -1,6 +1,23 @@
 use super::*;
 use crate::sampling::Sampling;
 
+pub(super) fn presence(request: &Json) -> Result<f32> {
+    let value = request
+        .get("presence_penalty")
+        .filter(|v| !v.is_null())
+        .map(|v| {
+            v.as_f64()
+                .ok_or_else(|| anyhow!("invalid presence_penalty"))
+        })
+        .transpose()?
+        .unwrap_or(0.0);
+    anyhow::ensure!(
+        value.is_finite() && (-2.0..=2.0).contains(&value),
+        "invalid presence_penalty"
+    );
+    Ok(value as f32)
+}
+
 pub(super) fn from_request(request: &Json) -> Result<Option<Sampling>> {
     let number = |name: &str, default: f64| -> Result<f64> {
         request
@@ -11,12 +28,12 @@ pub(super) fn from_request(request: &Json) -> Result<Option<Sampling>> {
             .map(|v| v.unwrap_or(default))
     };
     let temperature = number("temperature", 1.0)?;
+    presence(request)?;
     anyhow::ensure!(
         temperature.is_finite() && temperature >= 0.0,
         "invalid temperature"
     );
     for (name, default) in [
-        ("presence_penalty", 0.0),
         ("frequency_penalty", 0.0),
         ("repetition_penalty", 1.0),
         ("min_p", 0.0),
@@ -63,7 +80,7 @@ mod tests {
             json!({"temperature":1.0,"top_k":21}),
             json!({"temperature":1.0,"top_p":0.0}),
             json!({"temperature":1.0,"seed":-1}),
-            json!({"temperature":1.0,"presence_penalty":1.0}),
+            json!({"temperature":1.0,"presence_penalty":2.1}),
         ] {
             assert!(from_request(&invalid).is_err());
         }

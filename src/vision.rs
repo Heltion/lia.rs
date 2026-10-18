@@ -7,6 +7,7 @@ use std::io::Cursor;
 mod plan;
 mod positions;
 pub use plan::PositionPlan;
+mod huggingface;
 mod resize;
 pub use positions::ImageGrid;
 
