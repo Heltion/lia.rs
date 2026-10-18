@@ -19,13 +19,14 @@ impl Engine {
         model: &Model,
         projector: Option<&str>,
     ) -> Result<Self> {
-        if capacity == 0 || capacity > 32768 {
-            return Err(anyhow!("context capacity must be 1..=32768"));
-        }
         if !matches!(model.metadata.get("general.architecture"), Some(Value::String(s)) if s == "qwen35")
         {
             return Err(anyhow!("only qwen35 is implemented"));
         }
+        validate_capacity(
+            capacity,
+            usize::try_from(config_u64(model, "qwen35.context_length")?)?,
+        )?;
         for (key, expected) in [
             ("block_count", 65),
             ("nextn_predict_layers", 1),
@@ -186,8 +187,10 @@ impl Engine {
                 .unwrap_or_else(|_| "512".into())
                 .parse::<usize>()
                 .ok()
-                .filter(|batch| [512, 1024, 2048, 4096].contains(batch))
-                .ok_or_else(|| anyhow!("LIA_PREFILL_BATCH must be 512, 1024, 2048, or 4096"))?,
+                .filter(|batch| [128, 256, 512, 1024, 2048, 4096].contains(batch))
+                .ok_or_else(|| {
+                    anyhow!("LIA_PREFILL_BATCH must be 128, 256, 512, 1024, 2048, or 4096")
+                })?,
             prefill_tile: std::env::var("LIA_PREFILL_TILE")
                 .unwrap_or_else(|_| "128".into())
                 .parse::<usize>()
@@ -254,5 +257,31 @@ impl Engine {
         }
         engine.prepare_buffers()?;
         Ok(engine)
+    }
+}
+
+fn validate_capacity(capacity: usize, model_limit: usize) -> Result<()> {
+    let limit = model_limit.min(crate::MAX_CONTEXT_TOKENS);
+    anyhow::ensure!(
+        capacity > 0 && capacity <= limit,
+        "context capacity must be 1..={limit}"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_capacity_respects_model_and_index_limits() -> Result<()> {
+        for capacity in [1, 32768, 49152, 65536, 131072, 262144] {
+            validate_capacity(capacity, 262144)?;
+        }
+        assert!(validate_capacity(0, 262144).is_err());
+        assert!(validate_capacity(65536, 32768).is_err());
+        assert!(validate_capacity(262145, usize::MAX).is_err());
+        assert!(validate_capacity(1, 0).is_err());
+        Ok(())
     }
 }

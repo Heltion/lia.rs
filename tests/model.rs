@@ -170,19 +170,28 @@ fn stochastic_native_mtp_preserves_degenerate_target_and_rollback() -> Result<()
 #[test]
 #[ignore = "requires LIA_TEST_MODEL and a CUDA device"]
 fn prefill_workspace_and_reset_are_deterministic() -> Result<()> {
+    fn prefill(engine: &mut Engine, mut tokens: &[u32]) -> Result<()> {
+        while !tokens.is_empty() {
+            let count = engine.prefill_chunk(tokens.len())?;
+            engine.forward_many(&tokens[..count], false)?;
+            tokens = &tokens[count..];
+        }
+        Ok(())
+    }
+
     let path = std::env::var("LIA_TEST_MODEL")?;
     let mut engine = Engine::load(&path, 1024)?;
     let configured = std::env::var("LIA_PREFILL_FP8").as_deref() == Ok("1");
     assert_eq!(engine.fp8_prefill(), configured);
     let prefix = vec![109266; 513];
-    engine.forward_many(&prefix, false)?;
+    prefill(&mut engine, &prefix)?;
     let token = engine.current_token()?;
     let expected = engine.forward(token)?;
     assert!(expected.iter().all(|x| x.is_finite()));
     engine.reset()?;
     assert!(engine.forward_many(&[248320], false).is_err());
     engine.reset()?;
-    engine.forward_many(&prefix, false)?;
+    prefill(&mut engine, &prefix)?;
     assert_eq!(engine.current_token()?, token);
     let actual = engine.forward(token)?;
     assert_eq!(

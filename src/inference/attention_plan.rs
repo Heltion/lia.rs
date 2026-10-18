@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn reserved_workspace_covers_all_valid_batches_and_decode_modes() {
-        for capacity in [64, 512, 32768] {
+        for capacity in [64, 512, 32768, 65536, 262144] {
             let maximum = capacity.min(4096);
             for mma in [false, true] {
                 let reserved = reserved_bytes(maximum, capacity, mma, true);
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn chunk_planning_preserves_progress_and_legacy_limits() {
         let bytes = 768 * 1024 * 1024;
-        for position in [0, 2048, 4096, 8192, 16000, 32000] {
+        for position in [0, 2048, 4096, 8192, 16000, 32000, 65536, 262000] {
             for remaining in [1, 8, 143, 1668, 7472] {
                 let count = chunk(remaining, 2048, position, bytes, true, false).unwrap();
                 let tile = if count <= 8 {
