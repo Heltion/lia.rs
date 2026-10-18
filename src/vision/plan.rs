@@ -27,7 +27,7 @@ impl PositionPlan {
 
     pub fn append_text(&mut self, count: usize) -> Result<()> {
         ensure!(
-            count <= 32768 - self.len(),
+            count <= crate::MAX_CONTEXT_TOKENS - self.len(),
             "position plan exceeds context limit"
         );
         let next = self
@@ -42,7 +42,7 @@ impl PositionPlan {
     /// Image start/end markers are ordinary text, appended by the caller.
     pub fn append_image(&mut self, grid: ImageGrid) -> Result<usize> {
         ensure!(
-            grid.token_count() <= 32768 - self.len(),
+            grid.token_count() <= crate::MAX_CONTEXT_TOKENS - self.len(),
             "position plan exceeds context limit"
         );
         let start = self.len();
@@ -102,10 +102,13 @@ mod tests {
         let mut plan = PositionPlan::new();
         assert_eq!(plan.coordinates(0)?, [0; 4]);
         plan.append_text(32768)?;
+        plan.append_text(32768)?;
+        assert_eq!(plan.coordinates(65535)?, [65535; 4]);
+        plan.append_text(crate::MAX_CONTEXT_TOKENS - plan.len())?;
         assert!(plan.append_text(1).is_err());
         assert!(plan.append_image(ImageGrid::new(32, 32)?).is_err());
         assert_eq!(plan.coordinates(32767)?, [32767; 4]);
-        assert_eq!(plan.flattened().len(), 32768 * 4);
+        assert_eq!(plan.flattened().len(), crate::MAX_CONTEXT_TOKENS * 4);
         assert!(plan.coordinates(usize::MAX).is_err());
         Ok(())
     }
