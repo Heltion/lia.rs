@@ -31,9 +31,16 @@ impl Engine {
         }
         let mut encoded = Vec::new();
         for (start, image) in images {
+            let features = self.encode_image_buffer(image)?;
+            // Image features outlive an operator invocation. Owning their exact
+            // extent keeps image history from pinning preallocated scratch leases.
+            let mut data = DeviceBuffer::zeroed(&self.stream, features.len())?;
+            data.copy_from_device_async(&features, &self.stream)?;
+            self.stream.synchronize()?;
+            drop(features);
             encoded.push(Rc::new(ImageEmbedding {
                 start: *start,
-                data: self.encode_image_buffer(image)?,
+                data,
             }));
         }
         self.set_position_plan(Some(plan))?;

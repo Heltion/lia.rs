@@ -21,7 +21,17 @@ impl Engine {
         logits: &DeviceBuffer<f32>,
         sampling: &Sampling,
     ) -> Result<Vec<Distribution>> {
-        let adjusted = self.adjusted_logits(logits)?;
+        self.distributions_prefix(logits, sampling, &[], false)
+    }
+
+    pub(super) fn distributions_prefix(
+        &self,
+        logits: &DeviceBuffer<f32>,
+        sampling: &Sampling,
+        prefix: &[u32],
+        causal: bool,
+    ) -> Result<Vec<Distribution>> {
+        let adjusted = self.adjusted_logits_prefix(logits, prefix, causal)?;
         let logits = adjusted.as_deref().unwrap_or(logits);
         const VOCAB: usize = 248320;
         anyhow::ensure!(
@@ -77,12 +87,13 @@ impl Engine {
         drafts: &[u32],
         eos: u32,
         sampling: Option<&mut Sampling>,
+        prefix: &[u32],
     ) -> Result<(usize, u32)> {
         if let Some(sampling) = sampling {
-            let distributions = self.distributions(logits, sampling)?;
+            let distributions = self.distributions_prefix(logits, sampling, prefix, true)?;
             return sampling.select_prefix(&distributions, drafts, eos);
         }
-        let verified = self.greedy(logits)?;
+        let verified = self.greedy_prefix(logits, prefix, true)?;
         let mut accepted = 0;
         for (index, proposal) in drafts.iter().enumerate() {
             if verified[index] != *proposal {

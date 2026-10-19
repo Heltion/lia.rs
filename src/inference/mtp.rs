@@ -106,7 +106,15 @@ impl Engine {
         Ok(result)
     }
     pub(super) fn greedy(&self, logits: &DeviceBuffer<f32>) -> Result<Vec<u32>> {
-        let adjusted = self.adjusted_logits(logits)?;
+        self.greedy_prefix(logits, &[], false)
+    }
+    pub(super) fn greedy_prefix(
+        &self,
+        logits: &DeviceBuffer<f32>,
+        prefix: &[u32],
+        causal: bool,
+    ) -> Result<Vec<u32>> {
+        let adjusted = self.adjusted_logits_prefix(logits, prefix, causal)?;
         let logits = adjusted.as_deref().unwrap_or(logits);
         const VOCAB: usize = 248320;
         if logits.is_empty() || !logits.len().is_multiple_of(VOCAB) {

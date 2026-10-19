@@ -5,6 +5,8 @@ mod codebooks;
 pub mod gguf;
 #[cfg(feature = "cuda")]
 pub mod gpu;
+#[cfg(feature = "image-tools")]
+pub mod image_tools;
 #[cfg(feature = "cuda")]
 pub mod inference;
 pub mod quant;

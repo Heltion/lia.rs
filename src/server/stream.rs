@@ -52,7 +52,12 @@ impl Output {
                 )
             })
         });
-        (output, axum::response::Sse::new(events).into_response())
+        // Prefill and buffered tool arguments can outlast HTTP body-idle limits.
+        // SSE comments keep the transport live without adding model output.
+        let response = axum::response::Sse::new(events)
+            .keep_alive(axum::response::sse::KeepAlive::new())
+            .into_response();
+        (output, response)
     }
 
     fn send(&self, value: Json) {
@@ -199,6 +204,27 @@ impl Text {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_stream_preserves_transport_without_semantic_events() -> Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let (output, response) = Output::new(&json!({"model":"test"}));
+                let finish = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(16)).await;
+                    output.finish(&Ok(json!({"choices":[{"finish_reason":"stop"}]})));
+                });
+                let body = axum::body::to_bytes(response.into_body(), 65536).await?;
+                finish.await?;
+                let wire = std::str::from_utf8(&body)?;
+                assert!(wire.contains(":\n\n"), "expected a keepalive comment");
+                assert_eq!(wire.lines().filter(|s| s.starts_with("data:")).count(), 2);
+                assert!(wire.contains("[DONE]"));
+                Ok(())
+            })
+    }
 
     #[test]
     fn delimiters_and_unicode_across_every_byte() -> Result<()> {

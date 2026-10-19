@@ -3,6 +3,10 @@ use anyhow::Context;
 
 impl Engine {
     pub(super) fn weight(&self, name: &str) -> Result<&Weight> {
+        anyhow::ensure!(
+            !self.kv_offloaded || name.starts_with("vision."),
+            "attention cache is offloaded; language execution is unavailable"
+        );
         self.weights
             .get(name)
             .ok_or_else(|| anyhow!("missing tensor {name}"))

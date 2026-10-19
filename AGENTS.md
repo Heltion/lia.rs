@@ -29,5 +29,5 @@
 
 ## Validation and Reporting
 
-- Follow [the benchmark specification](docs/bench.md) for performance measurements and reporting.
+- Define measurement boundaries and token counts consistently when measuring and reporting performance.
 - Report only milestones supported by actual validation. Distinguish implementation progress from verified results.

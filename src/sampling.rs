@@ -35,7 +35,9 @@ impl Sampling {
             top_k,
             top_p,
             random: random::Random::new(seed as u32),
-            verification_random: random::Random::new(seed as u32),
+            // Keep acceptance/residual draws separate from target draws:
+            // identical seeds would reuse words already revealed by bonuses.
+            verification_random: random::Random::new(seed as u32 ^ 0x9e3779b9),
         })
     }
 
