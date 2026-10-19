@@ -6,6 +6,47 @@ use lia::{gpu, inference, server};
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next();
+    if matches!(command.as_deref(), None | Some("--help" | "-h" | "help")) {
+        println!(
+            "lia.rs — local inference in Rust\n\nCommands:\n  inspect MODEL\n  tokenize MODEL TEXT\n  render MODEL\n  decode-block TYPE"
+        );
+        #[cfg(feature = "cuda")]
+        println!(
+            "  serve MODEL [PORT] [CONTEXT] [--mmproj PROJECTOR]\n  forward MODEL TOKEN_IDS\n  forward-batch MODEL TOKEN_IDS\n  kernel-info"
+        );
+        #[cfg(feature = "image-tools")]
+        println!("  image-tools\n  read-image INPUT [OUTPUT.png] [--time SECONDS]");
+        return Ok(());
+    }
+
+    #[cfg(feature = "image-tools")]
+    if command.as_deref() == Some("image-tools") {
+        anyhow::ensure!(args.next().is_none(), "usage: lia image-tools");
+        return lia::image_tools::serve();
+    }
+    #[cfg(feature = "image-tools")]
+    if command.as_deref() == Some("read-image") {
+        let input = args
+            .next()
+            .ok_or_else(|| anyhow!("usage: lia read-image INPUT [OUTPUT.png] [--time SECONDS]"))?;
+        let mut output = None;
+        let mut time = None;
+        while let Some(arg) = args.next() {
+            if arg == "--time" {
+                anyhow::ensure!(time.is_none(), "duplicate --time");
+                time = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("missing --time seconds"))?
+                        .parse()?,
+                );
+            } else {
+                anyhow::ensure!(output.is_none(), "unexpected argument");
+                output = Some(arg);
+            }
+        }
+        return lia::image_tools::read_cli(&input, output.as_deref(), time);
+    }
+
     #[cfg(feature = "cuda")]
     if command.as_deref() == Some("forward-batch") {
         let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
@@ -144,7 +185,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if command.as_deref() != Some("inspect") {
-        return Err(anyhow!("usage: lia inspect MODEL.gguf"));
+        return Err(anyhow!("unknown command; run lia --help"));
     }
     let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
     if args.next().is_some() {

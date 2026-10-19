@@ -20,6 +20,7 @@ mod buffer;
 mod geometry;
 mod graph;
 mod gsq;
+mod host_weights;
 mod huggingface;
 mod initialize;
 mod moe;
@@ -92,6 +93,7 @@ pub struct Engine {
     stream: Arc<CudaStream>,
     module: kernels::LoadedModule,
     weights: BTreeMap<String, Weight>,
+    host_weight_bytes: usize,
     states: Vec<State>,
     position: usize,
     capacity: usize,
@@ -131,6 +133,8 @@ pub struct Engine {
     verify_hidden: Option<Buffer>,
     rotary: RefCell<RotaryWork>,
     vision_eps: Option<f32>,
+    host_vision: BTreeMap<String, vision::offload::HostWeight>,
+    kv_offloaded: bool,
     images: Vec<Rc<vision::ImageEmbedding>>,
 }
 fn config_u64(model: &Model, key: &str) -> Result<u64> {

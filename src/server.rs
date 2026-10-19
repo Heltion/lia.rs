@@ -4,7 +4,7 @@ use crate::{
     inference::{Engine, Snapshot},
     tokenizer::Tokenizer,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use serde_json::{Value as Json, json};
 use std::time::Instant;
 struct Session {
@@ -61,12 +61,13 @@ fn worker(
                 !eos_tokens.is_empty() && eos_tokens.iter().all(|id| *id < 248320),
                 "invalid EOS tokens"
             );
+            let engine = Engine::load_huggingface(&path, capacity, true)?;
+            let (minimum, maximum) = images::token_limits(&engine);
+            let processor = crate::vision::Processor::from_huggingface(&path, minimum, maximum)?;
             (
                 Tokenizer::from_huggingface(&path)?,
-                Engine::load_huggingface(&path, capacity, true)?,
-                Some(crate::vision::Processor::from_huggingface(
-                    &path, 256, 1024,
-                )?),
+                engine,
+                Some(processor),
                 std::fs::read_to_string(std::path::Path::new(&path).join("chat_template.jinja"))?,
                 eos_tokens,
             )
@@ -83,16 +84,18 @@ fn worker(
             };
             let (engine, processor) = if let Some(projector) = &projector {
                 let vision = Model::open(projector)?;
-                (
-                    Engine::load_with_vision(&path, capacity, projector)?,
-                    Some(crate::vision::Processor::from_model(&vision, 256, 1024)?),
-                )
+                let engine = Engine::load_with_vision(&path, capacity, projector)?;
+                let (minimum, maximum) = images::token_limits(&engine);
+                let processor = crate::vision::Processor::from_model(&vision, minimum, maximum)?;
+                (engine, Some(processor))
             } else {
                 (Engine::load_from_model(&path, capacity, &model)?, None)
             };
             (tokenizer, engine, processor, template, vec![eos])
         };
-        let checkpoint = engine.prepare_checkpoint()?;
+        let checkpoint = engine
+            .prepare_checkpoint()
+            .context("allocating service checkpoint")?;
         Ok((
             tokenizer,
             Session {
@@ -118,9 +121,12 @@ fn worker(
     }
     while let Some(job) = jobs.blocking_recv() {
         let response = match job.path.as_str() {
-            "/health" => Ok(
-                json!({"status":"ok","backend":"lia.rs","attention_workspace_bytes":session.engine.attention_reserved_bytes(),"query_tiled_attention":session.engine.query_tiled_attention(),"gdn_parallel_chunk_preparation":session.engine.gdn_parallel(),"cuda_graph":session.engine.cuda_graph_enabled(),"cuda_graph_stats":session.engine.cuda_graph_stats(),"gpu_buffers_preallocated":session.engine.buffers_preallocated(),"scratch_reserved_bytes":session.engine.scratch_reserved_bytes(),"thinking":true,"mtp":session.engine.mtp_enabled(),"sampling_modes":["greedy","top_k_top_p"],"sampling_top_k_max":20,"mtp_max_draft":session.engine.max_draft(),"stochastic_mtp":session.engine.stochastic_mtp(),"target_verify_max_batch":session.engine.max_draft()+1,"mtp_state_restore":"captured per-position recurrent states","prefill_batch":session.engine.prefill_batch(),"prefill_precision":session.engine.prefill_precision(),"prefill_fp8_min_tokens":65,"prefill_fp8_tile":128,"prefill_fp8_weight_workspace_bytes":session.engine.fp8_weight_workspace_bytes(),"prefill_fp8_weight_prepack_min_tokens":crate::gpu::fp8_cache::MIN_BATCH,"prefill_small_batch":8,"prefill_tensor_min_tokens":9,"prefill_medium_min_tokens":crate::gpu::MEDIUM_MIN_BATCH,"prefill_wide_min_tokens":crate::gpu::WIDE_MIN_BATCH,"prefill_wide_token_tile":session.engine.prefill_tile(),"kv_cache":"f16","activation_quantization":session.engine.integer_enabled(),"matrix_split_k":session.engine.matrix_layout().0,"matrix_row_group":session.engine.matrix_layout().1,"matrix_block_threads":session.engine.matrix_threads(),"attention":"partitioned_online_softmax_with_tensor_core_prefill","attention_tile":256,"attention_tensor_min_batch":session.engine.attention_mma_min_batch(),"attention_tensor_decode_min_context":512,"attention_small_batch_tile":128,"attention_decode_tile":64}),
-            ),
+            "/health" => {
+                let mut info = json!({"status":"ok","backend":"lia.rs","image_input":session.processor.is_some(),"image_token_limits":session.processor.as_ref().map(|_| images::token_limits(&session.engine)),"attention_workspace_bytes":session.engine.attention_reserved_bytes(),"query_tiled_attention":session.engine.query_tiled_attention(),"gdn_parallel_chunk_preparation":session.engine.gdn_parallel(),"cuda_graph":session.engine.cuda_graph_enabled(),"cuda_graph_stats":session.engine.cuda_graph_stats(),"gpu_buffers_preallocated":session.engine.buffers_preallocated(),"scratch_reserved_bytes":session.engine.scratch_reserved_bytes(),"thinking":true,"mtp":session.engine.mtp_enabled(),"sampling_modes":["greedy","top_k_top_p"],"sampling_top_k_max":20,"mtp_max_draft":session.engine.max_draft(),"stochastic_mtp":session.engine.stochastic_mtp(),"target_verify_max_batch":session.engine.max_draft()+1,"mtp_state_restore":"captured per-position recurrent states","prefill_batch":session.engine.prefill_batch(),"prefill_precision":session.engine.prefill_precision(),"prefill_fp8_min_tokens":65,"prefill_fp8_tile":128,"prefill_fp8_weight_workspace_bytes":session.engine.fp8_weight_workspace_bytes(),"prefill_fp8_weight_prepack_min_tokens":crate::gpu::fp8_cache::MIN_BATCH,"prefill_small_batch":8,"prefill_tensor_min_tokens":9,"prefill_medium_min_tokens":crate::gpu::MEDIUM_MIN_BATCH,"prefill_wide_min_tokens":crate::gpu::WIDE_MIN_BATCH,"prefill_wide_token_tile":session.engine.prefill_tile(),"kv_cache":"f16","activation_quantization":session.engine.integer_enabled(),"matrix_split_k":session.engine.matrix_layout().0,"matrix_row_group":session.engine.matrix_layout().1,"matrix_block_threads":session.engine.matrix_threads(),"attention":"partitioned_online_softmax_with_tensor_core_prefill","attention_tile":256,"attention_tensor_min_batch":session.engine.attention_mma_min_batch(),"attention_tensor_decode_min_context":512,"attention_small_batch_tile":128,"attention_decode_tile":64});
+                info["host_weight_bytes"] = session.engine.host_weight_bytes().into();
+                info["vision_weights_offload"] = session.engine.vision_offload_enabled().into();
+                Ok(info)
+            }
             "/v1/chat/completions" => session.chat(&tokenizer, &job.input, job.stream.as_ref()),
             "/apply-template" => crate::chat::render_template(&session.template, &job.input)
                 .map(|prompt| json!({"prompt":prompt})),

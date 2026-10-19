@@ -2,6 +2,17 @@ use super::*;
 use crate::sampling::Sampling;
 
 pub(super) fn presence(request: &Json) -> Result<f32> {
+    let default = match std::env::var("LIA_DEFAULT_PRESENCE_PENALTY") {
+        Ok(v) => v
+            .parse::<f64>()
+            .map_err(|e| anyhow!("invalid LIA_DEFAULT_PRESENCE_PENALTY: {e}"))?,
+        Err(std::env::VarError::NotPresent) => 0.0,
+        Err(e) => return Err(anyhow!("invalid LIA_DEFAULT_PRESENCE_PENALTY: {e}")),
+    };
+    presence_with_default(request, default)
+}
+
+fn presence_with_default(request: &Json, default: f64) -> Result<f32> {
     let value = request
         .get("presence_penalty")
         .filter(|v| !v.is_null())
@@ -10,7 +21,7 @@ pub(super) fn presence(request: &Json) -> Result<f32> {
                 .ok_or_else(|| anyhow!("invalid presence_penalty"))
         })
         .transpose()?
-        .unwrap_or(0.0);
+        .unwrap_or(default);
     anyhow::ensure!(
         value.is_finite() && (-2.0..=2.0).contains(&value),
         "invalid presence_penalty"
@@ -19,6 +30,17 @@ pub(super) fn presence(request: &Json) -> Result<f32> {
 }
 
 pub(super) fn from_request(request: &Json) -> Result<Option<Sampling>> {
+    let default_temperature = match std::env::var("LIA_DEFAULT_TEMPERATURE") {
+        Ok(value) => value
+            .parse::<f64>()
+            .map_err(|error| anyhow!("invalid LIA_DEFAULT_TEMPERATURE: {error}"))?,
+        Err(std::env::VarError::NotPresent) => 1.0,
+        Err(error) => return Err(anyhow!("invalid LIA_DEFAULT_TEMPERATURE: {error}")),
+    };
+    with_temperature_default(request, default_temperature)
+}
+
+fn with_temperature_default(request: &Json, default_temperature: f64) -> Result<Option<Sampling>> {
     let number = |name: &str, default: f64| -> Result<f64> {
         request
             .get(name)
@@ -27,7 +49,7 @@ pub(super) fn from_request(request: &Json) -> Result<Option<Sampling>> {
             .transpose()
             .map(|v| v.unwrap_or(default))
     };
-    let temperature = number("temperature", 1.0)?;
+    let temperature = number("temperature", default_temperature)?;
     presence(request)?;
     anyhow::ensure!(
         temperature.is_finite() && temperature >= 0.0,
@@ -63,6 +85,38 @@ pub(super) fn from_request(request: &Json) -> Result<Option<Sampling>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployment_presence_preserves_explicit_overrides() -> Result<()> {
+        assert_eq!(presence_with_default(&json!({}), 0.5)?, 0.5);
+        assert_eq!(
+            presence_with_default(&json!({"presence_penalty":0}), 0.5)?,
+            0.0
+        );
+        assert!(presence_with_default(&json!({}), f64::NAN).is_err());
+        assert!(presence_with_default(&json!({}), 2.1).is_err());
+        Ok(())
+    }
+    #[test]
+    fn deployment_temperature_preserves_request_overrides() -> Result<()> {
+        assert_eq!(
+            with_temperature_default(&json!({}), 0.6)?
+                .unwrap()
+                .settings(),
+            (0.6, 20, 0.95)
+        );
+        assert_eq!(
+            with_temperature_default(&json!({"temperature": 1.0}), 0.6)?
+                .unwrap()
+                .settings(),
+            (1.0, 20, 0.95)
+        );
+        assert!(with_temperature_default(&json!({"temperature": 0.0}), 0.6)?.is_none());
+        for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(with_temperature_default(&json!({}), invalid).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn sampling_request_validation() -> Result<()> {

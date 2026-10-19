@@ -6,7 +6,7 @@ impl Engine {
         context: Arc<CudaContext>,
         stream: Arc<CudaStream>,
         module: kernels::LoadedModule,
-        weights: BTreeMap<String, Weight>,
+        mut weights: BTreeMap<String, Weight>,
         capacity: usize,
         geometry: Geometry,
         eps: f32,
@@ -14,6 +14,11 @@ impl Engine {
         fp8_prefill: bool,
         cuda_graph: bool,
     ) -> Result<Self> {
+        let host_vision = if vision::offload::enabled() {
+            vision::offload::park_weights(&mut weights, &stream)?
+        } else {
+            BTreeMap::new()
+        };
         let mut states = Vec::new();
         for layer in 0..geometry.layers + usize::from(geometry.mtp) {
             states.push(if layer == geometry.layers || (layer + 1) % 4 == 0 {
@@ -58,6 +63,7 @@ impl Engine {
             stream: stream.clone(),
             module,
             weights,
+            host_weight_bytes: 0,
             states,
             position: 0,
             capacity,
@@ -136,6 +142,8 @@ impl Engine {
             verify_hidden: None,
             rotary,
             vision_eps: None,
+            host_vision,
+            kv_offloaded: false,
             images: Vec::new(),
         };
         engine.geometry.mtp &= engine.max_draft > 0;

@@ -3,7 +3,7 @@ use super::*;
 use anyhow::Context;
 
 const MIB: usize = 1024 * 1024;
-const RESERVE: usize = 768 * MIB;
+const RESERVE: usize = 512 * MIB;
 const SMALL_ELEMENTS: usize = 48 * 17408 * 8 + 2 * 248320 * 8;
 
 fn reservation(batch: usize, attention: usize) -> (usize, usize, usize) {
@@ -67,11 +67,12 @@ impl Engine {
                 self.attention_query_tiles,
             )
         };
-        // Non-speculative execution does not need draft/verification headroom.
+        // Leave space for the server checkpoint and driver allocations after
+        // reserving scratch. Draft state itself was allocated during initialization.
         let reserve = if self.geometry.mtp {
             RESERVE
         } else {
-            128 * MIB
+            256 * MIB
         };
         let maximum = self.prefill_batch.min(self.capacity);
         let batch = [4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 1]

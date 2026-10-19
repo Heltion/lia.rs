@@ -80,6 +80,8 @@ impl Engine {
             fp8_prefill || std::env::var("LIA_PREFILL_WEIGHT_PREPACK").as_deref() != Ok("1"),
             "FP8 weight prepacking requires LIA_PREFILL_FP8=1"
         );
+        let placement = host_weights::Placement::from_env()?;
+        let mut host_weight_bytes = 0;
         for tensor in &model.tensors {
             let mut host = vec![0; tensor.byte_len as usize];
             file.seek(SeekFrom::Start(model.data_offset + tensor.offset))?;
@@ -87,6 +89,7 @@ impl Engine {
                 .with_context(|| format!("reading tensor {}", tensor.name))?;
             let (block, bytes) = crate::gguf::layout(tensor.kind)
                 .ok_or_else(|| anyhow!("unsupported storage layout"))?;
+            let on_host = placement.contains(&tensor.name);
             let floats = if tensor.kind == 0 {
                 let values: Vec<f32> = host
                     .as_chunks::<4>()
@@ -94,11 +97,20 @@ impl Engine {
                     .iter()
                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                     .collect();
-                Some(DeviceBuffer::from_host(&stream, &values)?)
+                Some(if on_host {
+                    host_weights::allocate(&context, &values)?
+                } else {
+                    DeviceBuffer::from_host(&stream, &values)?
+                })
             } else {
                 None
             };
-            let data = DeviceBuffer::from_host(&stream, &host)?;
+            let data = if on_host {
+                host_weight_bytes += host.len() + floats.as_ref().map_or(0, |v| v.num_bytes());
+                host_weights::allocate(&context, &host)?
+            } else {
+                DeviceBuffer::from_host(&stream, &host)?
+            };
             weights.insert(
                 tensor.name.clone(),
                 Weight {
@@ -137,8 +149,17 @@ impl Engine {
             fp8_prefill,
             cuda_graph,
         )?;
+        engine.host_weight_bytes = host_weight_bytes;
         if let Some(path) = projector {
-            engine.load_vision(path)?;
+            if vision::offload::enabled() {
+                let cache = engine.park_attention()?;
+                engine.load_vision(path)?;
+                engine.host_vision =
+                    vision::offload::park_weights(&mut engine.weights, &engine.stream)?;
+                engine.restore_attention(cache)?;
+            } else {
+                engine.load_vision(path)?;
+            }
         }
         engine.prepare_buffers()?;
         Ok(engine)
