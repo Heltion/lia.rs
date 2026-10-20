@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 
 impl Engine {
     pub(super) fn linear_attention(&self, layer: usize, x: &DeviceBuffer<f32>) -> Result<Buffer> {
@@ -52,16 +53,36 @@ impl Engine {
         // SAFETY: model dimensions were checked at load; state rows and history
         // channels have unique writers and launches are ordered on one stream.
         unsafe {
-            self.module.convolution.conv_silu(
-                &self.stream,
-                LaunchConfig::for_num_elems(self.geometry.recurrent_width() as u32),
-                self.geometry.recurrent_width(),
-                &qkv,
-                self.floats(&format!("{prefix}.ssm_conv1d.weight"))?,
-                history.cu_deviceptr() as *mut f32,
-                captured.map_or(core::ptr::null_mut(), |(c, _)| c.cu_deviceptr() as *mut f32),
-                conv.cu_deviceptr() as *mut f32,
-            )?;
+            if self.parallel_convolution && batch > 8 && !self.capture {
+                let mut initial = self.zeros(history.len())?;
+                initial
+                    .copy_from_device_async(history, &self.stream)
+                    .context("snapshotting causal convolution history")?;
+                self.module.conv_parallel.conv_silu_parallel(
+                    &self.stream,
+                    LaunchConfig::for_num_elems(
+                        (batch.div_ceil(4) * self.geometry.recurrent_width()) as u32,
+                    ),
+                    self.geometry.recurrent_width(),
+                    &qkv,
+                    self.floats(&format!("{prefix}.ssm_conv1d.weight"))?,
+                    &initial,
+                    history.cu_deviceptr() as *mut f32,
+                    core::ptr::null_mut(),
+                    conv.cu_deviceptr() as *mut f32,
+                )?;
+            } else {
+                self.module.convolution.conv_silu(
+                    &self.stream,
+                    LaunchConfig::for_num_elems(self.geometry.recurrent_width() as u32),
+                    self.geometry.recurrent_width(),
+                    &qkv,
+                    self.floats(&format!("{prefix}.ssm_conv1d.weight"))?,
+                    history.cu_deviceptr() as *mut f32,
+                    captured.map_or(core::ptr::null_mut(), |(c, _)| c.cu_deviceptr() as *mut f32),
+                    conv.cu_deviceptr() as *mut f32,
+                )?;
+            }
             self.module.convolution.l2_norm(
                 &self.stream,
                 LaunchConfig::for_num_elems((batch * 32 * 32) as u32),

@@ -10,8 +10,3 @@ model weights support it.
 
 This project is in early development. It currently supports only a small number
 of models, and performance still needs improvement.
-
-[Pelican test](docs/pelican/README.md)
-
-The image tool returns rendered SVG frames through MCP without capturing the
-desktop.

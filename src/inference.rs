@@ -62,6 +62,8 @@ struct GroupScale {
     scales: DeviceBuffer<f32>,
 }
 struct RoutingWork {
+    router_count: DeviceBuffer<u32>,
+    register: Option<crate::gpu::moe::RegisterWork>,
     grouped: crate::gpu::moe::Grouped,
     selected: DeviceBuffer<u32>,
     probabilities: DeviceBuffer<f32>,
@@ -117,8 +119,11 @@ pub struct Engine {
     split_k: usize,
     row_group: usize,
     matrix_threads: usize,
+    parallel_convolution: bool,
     attention_mma_decode: bool,
-    attention_query_tiles: bool,
+    attention_merge_shared: bool,
+    attention_decode_span: usize,
+    attention_query_tiles: usize,
     attention_work: RefCell<Option<DeviceBuffer<f32>>>,
     prefill_tile: usize,
     prefill_batch: usize,

@@ -2,7 +2,15 @@
 use super::*;
 use cuda_core::{PinnedHostBuffer, simt::device_buffer::DeviceCopy};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    RowMajor,
+    Register,
+}
+
 pub(super) struct Packed {
+    layout: Layout,
+    register_compatible: bool,
     pub data: DeviceBuffer<u8>,
     pub scales: DeviceBuffer<u16>,
     host_data: Option<Mapped<u8>>,
@@ -73,6 +81,8 @@ impl Packed {
         let data_split = resident_rows * columns / 4;
         let scale_split = resident_rows * columns / 128;
         Ok(Self {
+            layout: Layout::RowMajor,
+            register_compatible: scales.iter().all(|s| (1..=253).contains(&((s >> 7) & 255))),
             data: DeviceBuffer::from_host(stream, &matrix.packed[..data_split])?,
             scales: DeviceBuffer::from_host(stream, &scales[..scale_split])?,
             host_data: if offload == 0 {
@@ -86,6 +96,64 @@ impl Packed {
                 Some(Mapped::new(stream, &scales[scale_split..])?)
             },
         })
+    }
+
+    pub(super) fn repacked(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &std::sync::Arc<CudaStream>,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Self> {
+        ensure!(
+            self.can_register(),
+            "register MMA requires resident normal-scale row-major experts"
+        );
+        ensure!(
+            rows.is_multiple_of(16)
+                && columns.is_multiple_of(128)
+                && self.data.len() == rows * columns / 4
+                && self.scales.len() == rows * columns / 128,
+            "invalid register MMA repack extent"
+        );
+        let data = DeviceBuffer::zeroed(stream, self.data.len())?;
+        let scales = DeviceBuffer::zeroed(stream, self.scales.len())?;
+        // SAFETY: complete tiles and disjoint equally sized allocations. CUDA
+        // buffer alignment permits the u16 view of the packed byte storage.
+        unsafe {
+            module.moe_repack.weights(
+                stream,
+                LaunchConfig::for_num_elems((data.len() / 2) as u32),
+                rows,
+                columns,
+                &self.data,
+                data.cu_deviceptr() as *mut u16,
+            )?;
+            module.moe_repack.scales(
+                stream,
+                LaunchConfig::for_num_elems(scales.len() as u32),
+                rows,
+                columns,
+                &self.scales,
+                scales.cu_deviceptr() as *mut u16,
+            )?;
+        }
+        Ok(Self {
+            layout: Layout::Register,
+            register_compatible: true,
+            data,
+            scales,
+            host_data: None,
+            host_scales: None,
+        })
+    }
+
+    pub fn can_register(&self) -> bool {
+        self.layout == Layout::RowMajor && self.register_compatible && !self.is_offloaded()
+    }
+
+    pub fn is_register(&self) -> bool {
+        self.layout == Layout::Register
     }
 
     pub fn is_offloaded(&self) -> bool {

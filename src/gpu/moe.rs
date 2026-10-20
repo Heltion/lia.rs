@@ -2,8 +2,11 @@ use super::*;
 use crate::quant::gsq::Matrix;
 use anyhow::{Result, ensure};
 mod grouped;
+mod layout;
 pub(crate) use grouped::Grouped;
 
+mod selected;
+pub(crate) use selected::RegisterWork;
 mod storage;
 use storage::Packed;
 
@@ -54,6 +57,10 @@ impl Experts {
         activated: &mut DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
+        ensure!(
+            !self.is_register(),
+            "row-major MoE called with register layout"
+        );
         if self.gate.is_offloaded() {
             self.forward_impl::<true>(
                 module,

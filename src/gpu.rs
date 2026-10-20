@@ -1,6 +1,9 @@
 //! Rust GPU operators and host launch validation.
 use anyhow::anyhow;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, simt::LaunchConfig};
+#[cfg(test)]
+mod attention_compact;
+pub(crate) mod attention_wide;
 mod dispatch;
 mod inspection;
 pub(crate) mod kernels;
@@ -331,3 +334,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod attention_bf16;

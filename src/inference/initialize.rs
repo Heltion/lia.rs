@@ -47,6 +47,18 @@ impl Engine {
             experts: BTreeMap::new(),
             routing: if geometry.moe {
                 Some(RoutingWork {
+                    router_count: DeviceBuffer::zeroed(&stream, 8)?,
+                    register: if std::env::var("LIA_MOE_REGISTER_MMA").as_deref() == Ok("1") {
+                        Some(crate::gpu::moe::RegisterWork::new(
+                            &stream,
+                            8,
+                            geometry.hidden,
+                            512,
+                            std::env::var("LIA_MOE_STAGED").as_deref() == Ok("1"),
+                        )?)
+                    } else {
+                        None
+                    },
                     grouped: crate::gpu::moe::Grouped::new(&stream, crate::gpu::MAX_PREFILL_BATCH)?,
                     selected: DeviceBuffer::zeroed(&stream, crate::gpu::MAX_PREFILL_BATCH * 8)?,
                     probabilities: DeviceBuffer::zeroed(
@@ -92,8 +104,26 @@ impl Engine {
                 .ok()
                 .filter(|n| [64, 128].contains(n))
                 .ok_or_else(|| anyhow!("LIA_MM_THREADS must be 64, 128 or 256"))?,
-            attention_mma_decode: std::env::var("LIA_ATTN_MMA_DECODE").as_deref() == Ok("1"),
-            attention_query_tiles: std::env::var("LIA_ATTN_QUERY_TILES").as_deref() == Ok("1"),
+            attention_decode_span: std::env::var("LIA_ATTN_DECODE_SPAN")
+                .unwrap_or_else(|_| "128".into())
+                .parse::<usize>()
+                .ok()
+                .filter(|n| [128, 256].contains(n))
+                .ok_or_else(|| anyhow!("LIA_ATTN_DECODE_SPAN must be 128 or 256"))?,
+            attention_merge_shared: std::env::var("LIA_ATTN_MERGE_SHARED").as_deref() == Ok("1"),
+            parallel_convolution: std::env::var("LIA_CONV_PARALLEL").as_deref() == Ok("1"),
+            attention_mma_decode: std::env::var("LIA_ATTN_MMA_DECODE")
+                .map_or(geometry.moe, |value| value == "1"),
+            attention_query_tiles: if std::env::var("LIA_ATTN_QUERY_TILES").as_deref() == Ok("1") {
+                std::env::var("LIA_ATTN_QUERY_ROWS")
+                    .unwrap_or_else(|_| "32".into())
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| [32, 64].contains(n))
+                    .ok_or_else(|| anyhow!("LIA_ATTN_QUERY_ROWS must be 32 or 64"))?
+            } else {
+                0
+            },
             attention_work: RefCell::new(None),
             prefill_batch: std::env::var("LIA_PREFILL_BATCH")
                 .unwrap_or_else(|_| "512".into())

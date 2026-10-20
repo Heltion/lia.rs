@@ -155,7 +155,7 @@ impl Engine {
     }
 
     pub fn query_tiled_attention(&self) -> bool {
-        self.attention_query_tiles
+        self.attention_query_tiles != 0
     }
 
     pub fn gdn_parallel(&self) -> bool {

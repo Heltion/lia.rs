@@ -156,12 +156,14 @@ impl Engine {
             let gate = loader.expert_stack(&prefix, "gate_proj", 512, 2048)?;
             let up = loader.expert_stack(&prefix, "up_proj", 512, 2048)?;
             let down = loader.expert_stack(&prefix, "down_proj", 2048, 512)?;
-            experts.insert(
-                layer,
-                crate::gpu::moe::Experts::upload_offloaded(
-                    &stream, 2048, 512, gate, up, down, offload,
-                )?,
-            );
+            let mut block = crate::gpu::moe::Experts::upload_offloaded(
+                &stream, 2048, 512, gate, up, down, offload,
+            )?;
+            if std::env::var("LIA_MOE_REGISTER_MMA").as_deref() == Ok("1") {
+                let enabled = block.prepare_register(&module, &stream)?;
+                eprintln!("MoE register MMA block {layer}: {enabled}");
+            }
+            experts.insert(layer, block);
             eprintln!("loaded MoE block {}/40", layer + 1);
         }
         if vision {
@@ -176,9 +178,19 @@ impl Engine {
             mtp: false,
             moe: true,
         };
+        let host_embedding_bytes = if std::env::var("LIA_HOST_EMBEDDING").as_deref() == Ok("1") {
+            weights
+                .get("token_embd.weight")
+                .context("missing token embeddings")?
+                .data
+                .len()
+        } else {
+            0
+        };
         let mut engine = Self::initialize(
             context, stream, module, weights, capacity, geometry, eps, rope, false, cuda_graph,
         )?;
+        engine.host_weight_bytes = host_embedding_bytes;
         engine.experts = experts;
         if vision {
             engine.vision_eps = Some(1e-6);

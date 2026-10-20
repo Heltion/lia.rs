@@ -1,6 +1,7 @@
 use super::*;
 
 pub(crate) struct Grouped {
+    pub(super) static_store: bool,
     capacity: usize,
     counts: DeviceBuffer<u32>,
     choices: DeviceBuffer<u32>,
@@ -14,10 +15,11 @@ impl Grouped {
             "invalid grouped MoE capacity"
         );
         Ok(Self {
+            static_store: std::env::var("LIA_MOE_STATIC_STORE").as_deref() == Ok("1"),
             capacity,
             counts: DeviceBuffer::zeroed(stream, 256)?,
             choices: DeviceBuffer::zeroed(stream, 256 * capacity)?,
-            tiles: DeviceBuffer::zeroed(stream, 1 + 2 * (capacity.div_ceil(2) + 256))?,
+            tiles: DeviceBuffer::zeroed(stream, 1 + 2 * (capacity.div_ceil(4) + 256))?,
         })
     }
 }
@@ -31,18 +33,37 @@ impl Experts {
         stream: &std::sync::Arc<CudaStream>,
         work: &Grouped,
         input: &DeviceBuffer<f32>,
+        packed_input: Option<&DeviceBuffer<u32>>,
+        half_codes: bool,
         selected: &DeviceBuffer<u32>,
         probabilities: &DeviceBuffer<f32>,
         activated: &mut DeviceBuffer<f32>,
         choices_out: &mut DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
-        if self.gate.is_offloaded() {
-            self.forward_grouped_impl::<true>(
+        if self.is_register() {
+            return self.forward_grouped_impl::<false, true>(
                 module,
                 stream,
                 work,
                 input,
+                packed_input,
+                half_codes,
+                selected,
+                probabilities,
+                activated,
+                choices_out,
+                output,
+            );
+        }
+        if self.gate.is_offloaded() {
+            self.forward_grouped_impl::<true, false>(
+                module,
+                stream,
+                work,
+                input,
+                packed_input,
+                half_codes,
                 selected,
                 probabilities,
                 activated,
@@ -50,11 +71,13 @@ impl Experts {
                 output,
             )
         } else {
-            self.forward_grouped_impl::<false>(
+            self.forward_grouped_impl::<false, false>(
                 module,
                 stream,
                 work,
                 input,
+                packed_input,
+                half_codes,
                 selected,
                 probabilities,
                 activated,
@@ -65,12 +88,14 @@ impl Experts {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward_grouped_impl<const HOST: bool>(
+    fn forward_grouped_impl<const HOST: bool, const REGISTER: bool>(
         &self,
         module: &kernels::LoadedModule,
         stream: &std::sync::Arc<CudaStream>,
         work: &Grouped,
         input: &DeviceBuffer<f32>,
+        packed_input: Option<&DeviceBuffer<u32>>,
+        half_codes: bool,
         selected: &DeviceBuffer<u32>,
         probabilities: &DeviceBuffer<f32>,
         activated: &mut DeviceBuffer<f32>,
@@ -91,14 +116,18 @@ impl Experts {
                 && output.len() == batch * self.hidden,
             "invalid grouped expert buffer extents"
         );
-        let maximum_tiles = batch.div_ceil(2) + 256;
+        let maximum_tiles = batch.div_ceil(4) + 256;
         // SAFETY: the router produces distinct IDs in 0..256. Each expert list
-        // has at most batch choices. The sum of ceil(count/16) is bounded by
-        // batch*8/16 + 256; descriptor and MMA launches are stream ordered.
+        // has at most batch choices. The sum of ceil(count/32) is bounded by
+        // batch*8/32 + 256; descriptor and MMA launches are stream ordered.
         unsafe {
             module.moe_grouping.group(
                 stream,
-                LaunchConfig::for_num_elems(256),
+                LaunchConfig {
+                    grid_dim: (64, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                },
                 batch,
                 selected,
                 work.counts.cu_deviceptr() as *mut u32,
@@ -115,46 +144,80 @@ impl Experts {
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
-            module.moe_tensor.matmul::<true, HOST>(
-                stream,
-                config(self.intermediate),
-                self.hidden,
-                self.intermediate,
-                batch,
-                &work.counts,
-                &work.choices,
-                &work.tiles,
-                &self.gate.data,
-                &self.gate.scales,
-                &self.up.data,
-                &self.up.scales,
-                self.gate.host_data(),
-                self.gate.host_scales(),
-                self.up.host_data(),
-                self.up.host_scales(),
-                input,
-                activated.cu_deviceptr() as *mut f32,
-            )?;
-            module.moe_tensor.matmul::<false, HOST>(
-                stream,
-                config(self.hidden),
-                self.intermediate,
-                self.hidden,
-                batch,
-                &work.counts,
-                &work.choices,
-                &work.tiles,
-                &self.down.data,
-                &self.down.scales,
-                &self.down.data,
-                &self.down.scales,
-                self.down.host_data(),
-                self.down.host_scales(),
-                self.down.host_data(),
-                self.down.host_scales(),
-                activated,
-                choices_out.cu_deviceptr() as *mut f32,
-            )?;
+            if let Some(packed) = packed_input {
+                ensure!(
+                    packed.len() >= input.len().max(activated.len()) / 2,
+                    "packed grouped expert workspace too small"
+                );
+            }
+            macro_rules! project {
+                ($gate:literal, $packed:literal, $weights:expr, $up:expr, $x:expr, $out:expr) => {
+                    macro_rules! run {
+                        ($half:literal, $static:literal) => {
+                            module
+                                .moe_tensor
+                                .matmul::<$gate, HOST, REGISTER, $packed, $half, $static>(
+                                    stream,
+                                    config(if $gate {
+                                        self.intermediate
+                                    } else {
+                                        self.hidden
+                                    }),
+                                    if $gate {
+                                        self.hidden
+                                    } else {
+                                        self.intermediate
+                                    },
+                                    if $gate {
+                                        self.intermediate
+                                    } else {
+                                        self.hidden
+                                    },
+                                    batch,
+                                    &work.counts,
+                                    &work.choices,
+                                    &work.tiles,
+                                    &$weights.data,
+                                    &$weights.scales,
+                                    &$up.data,
+                                    &$up.scales,
+                                    $weights.host_data(),
+                                    $weights.host_scales(),
+                                    $up.host_data(),
+                                    $up.host_scales(),
+                                    $x,
+                                    packed_input.unwrap_or(&work.tiles),
+                                    $out.cu_deviceptr() as *mut f32,
+                                )?
+                        };
+                    }
+                    match (half_codes, work.static_store) {
+                        (false, false) => run!(false, false),
+                        (true, false) => run!(true, false),
+                        (false, true) => run!(false, true),
+                        (true, true) => run!(true, true),
+                    }
+                };
+            }
+            if let Some(packed) = packed_input {
+                module.tensor.pack_input(
+                    stream,
+                    LaunchConfig::for_num_elems((input.len() / 2) as u32),
+                    input,
+                    packed.cu_deviceptr() as *mut u32,
+                )?;
+                project!(true, true, self.gate, self.up, input, activated);
+                module.tensor.pack_input(
+                    stream,
+                    LaunchConfig::for_num_elems((activated.len() / 2) as u32),
+                    activated,
+                    packed.cu_deviceptr() as *mut u32,
+                )?;
+                project!(false, true, self.down, self.down, activated, choices_out);
+            } else {
+                project!(true, false, self.gate, self.up, input, activated);
+                project!(false, false, self.down, self.down, activated, choices_out);
+            }
             module.moe_grouping.merge(
                 stream,
                 LaunchConfig::for_num_elems(output.len() as u32),
@@ -199,113 +262,158 @@ mod tests {
             packed: m.packed.clone(),
             scales: m.scales.clone(),
         };
-        let experts = Experts::upload_offloaded(
-            &stream,
-            128,
-            128,
-            clone_matrix(&gate),
-            clone_matrix(&up),
-            clone_matrix(&down),
-            128,
-        )?;
-        let work = Grouped::new(&stream, 257)?;
-        for batch in [9usize, 33, 129, 257] {
-            let selected = (0..batch * 8)
-                .map(|i| {
-                    if batch < 100 {
-                        (i % 8) as u32
-                    } else if batch == 257 {
-                        (248 + i % 8) as u32
-                    } else {
-                        ((i / 8 * 17 + i % 8 * 31) % 256) as u32
+        for offload in [0, 128] {
+            let experts = Experts::upload_offloaded(
+                &stream,
+                128,
+                128,
+                clone_matrix(&gate),
+                clone_matrix(&up),
+                clone_matrix(&down),
+                offload,
+            )?;
+            let work = Grouped::new(&stream, 257)?;
+            for batch in [9usize, 33, 129, 257] {
+                let selected = (0..batch * 8)
+                    .map(|i| {
+                        if batch < 100 {
+                            (i % 8) as u32
+                        } else if batch == 257 {
+                            (248 + i % 8) as u32
+                        } else {
+                            ((i / 8 * 17 + i % 8 * 31) % 256) as u32
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let probabilities = (0..batch * 8)
+                    .map(|i| (i % 8 + 1) as f32 / 36.0)
+                    .collect::<Vec<_>>();
+                let input = (0..batch * 128)
+                    .map(|i| (i as i32 % 19 - 9) as f32 / 64.0)
+                    .collect::<Vec<_>>();
+                let mut expected_act = vec![0.0f32; batch * 8 * 128];
+                let mut expected = vec![0.0f32; batch * 128];
+                for choice in 0..batch * 8 {
+                    let token = choice / 8;
+                    for row in 0..128 {
+                        let dot = |matrix: &Matrix| {
+                            (0..128)
+                                .map(|c| {
+                                    let w = (matrix
+                                        .value(selected[choice] as usize * 128 + row, c)
+                                        .unwrap()
+                                        as f16) as f32;
+                                    let x = (input[token * 128 + c] as f16) as f32;
+                                    w * x
+                                })
+                                .sum::<f32>()
+                        };
+                        let g = dot(&gate);
+                        expected_act[choice * 128 + row] = g / (1.0 + (-g).exp()) * dot(&up);
                     }
-                })
-                .collect::<Vec<_>>();
-            let probabilities = (0..batch * 8)
-                .map(|i| (i % 8 + 1) as f32 / 36.0)
-                .collect::<Vec<_>>();
-            let input = (0..batch * 128)
-                .map(|i| (i as i32 % 19 - 9) as f32 / 64.0)
-                .collect::<Vec<_>>();
-            let mut expected_act = vec![0.0f32; batch * 8 * 128];
-            let mut expected = vec![0.0f32; batch * 128];
-            for choice in 0..batch * 8 {
-                let token = choice / 8;
-                for row in 0..128 {
-                    let dot = |matrix: &Matrix| {
-                        (0..128)
+                    for row in 0..128 {
+                        let sum = (0..128)
                             .map(|c| {
-                                let w = (matrix
+                                let w = (down
                                     .value(selected[choice] as usize * 128 + row, c)
                                     .unwrap() as f16)
                                     as f32;
-                                let x = (input[token * 128 + c] as f16) as f32;
-                                w * x
+                                w * ((expected_act[choice * 128 + c] as f16) as f32)
                             })
-                            .sum::<f32>()
-                    };
-                    let g = dot(&gate);
-                    expected_act[choice * 128 + row] = g / (1.0 + (-g).exp()) * dot(&up);
+                            .sum::<f32>();
+                        expected[token * 128 + row] += sum * probabilities[choice];
+                    }
                 }
-                for row in 0..128 {
-                    let sum = (0..128)
-                        .map(|c| {
-                            let w = (down
-                                .value(selected[choice] as usize * 128 + row, c)
-                                .unwrap() as f16) as f32;
-                            w * ((expected_act[choice * 128 + c] as f16) as f32)
-                        })
-                        .sum::<f32>();
-                    expected[token * 128 + row] += sum * probabilities[choice];
+                let dx = DeviceBuffer::from_host(&stream, &input)?;
+                let ids = DeviceBuffer::from_host(&stream, &selected)?;
+                let probs = DeviceBuffer::from_host(&stream, &probabilities)?;
+                let mut activated = DeviceBuffer::zeroed(&stream, expected_act.len())?;
+                let mut choices = DeviceBuffer::zeroed(&stream, batch * 8 * 128)?;
+                let mut output = DeviceBuffer::zeroed(&stream, expected.len())?;
+                experts.forward_grouped(
+                    &module,
+                    &stream,
+                    &work,
+                    &dx,
+                    None,
+                    false,
+                    &ids,
+                    &probs,
+                    &mut activated,
+                    &mut choices,
+                    &mut output,
+                )?;
+                let baseline = [
+                    activated.to_host_vec(&stream)?,
+                    choices.to_host_vec(&stream)?,
+                    output.to_host_vec(&stream)?,
+                ];
+                let extent = dx.len().max(activated.len()) / 2;
+                let sentinel = 0x1234_5678u32;
+                let packed = DeviceBuffer::from_host(&stream, &vec![sentinel; extent + 32])?;
+                experts.forward_grouped(
+                    &module,
+                    &stream,
+                    &work,
+                    &dx,
+                    Some(&packed),
+                    true,
+                    &ids,
+                    &probs,
+                    &mut activated,
+                    &mut choices,
+                    &mut output,
+                )?;
+                for (actual, expected) in [
+                    activated.to_host_vec(&stream)?,
+                    choices.to_host_vec(&stream)?,
+                    output.to_host_vec(&stream)?,
+                ]
+                .iter()
+                .zip(&baseline)
+                {
+                    assert_eq!(
+                        actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "packed grouped result: batch={batch}, offload={offload}"
+                    );
                 }
-            }
-            let dx = DeviceBuffer::from_host(&stream, &input)?;
-            let ids = DeviceBuffer::from_host(&stream, &selected)?;
-            let probs = DeviceBuffer::from_host(&stream, &probabilities)?;
-            let mut activated = DeviceBuffer::zeroed(&stream, expected_act.len())?;
-            let mut choices = DeviceBuffer::zeroed(&stream, batch * 8 * 128)?;
-            let mut output = DeviceBuffer::zeroed(&stream, expected.len())?;
-            experts.forward_grouped(
-                &module,
-                &stream,
-                &work,
-                &dx,
-                &ids,
-                &probs,
-                &mut activated,
-                &mut choices,
-                &mut output,
-            )?;
-            for (actual, expected) in activated.to_host_vec(&stream)?.iter().zip(expected_act) {
                 assert!(
-                    (actual - expected).abs() < 1e-4 * expected.abs().max(1.0),
-                    "activation batch={batch}"
+                    packed.to_host_vec(&stream)?[extent..]
+                        .iter()
+                        .all(|&x| x == sentinel)
                 );
+                for (actual, expected) in activated.to_host_vec(&stream)?.iter().zip(expected_act) {
+                    assert!(
+                        (actual - expected).abs() < 1e-4 * expected.abs().max(1.0),
+                        "activation batch={batch}"
+                    );
+                }
+                for (actual, expected) in output.to_host_vec(&stream)?.iter().zip(expected) {
+                    assert!(
+                        (actual - expected).abs() < 1e-4 * expected.abs().max(1.0),
+                        "output batch={batch}: {actual} != {expected}"
+                    );
+                }
+                let counts = work.counts.to_host_vec(&stream)?;
+                let mapping = work.choices.to_host_vec(&stream)?;
+                let tiles = work.tiles.to_host_vec(&stream)?;
+                let mut expected_tiles = 0;
+                for expert in 0..256 {
+                    let expected = selected
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &id)| (id as usize == expert).then_some(i as u32))
+                        .collect::<Vec<_>>();
+                    assert_eq!(counts[expert] as usize, expected.len());
+                    assert_eq!(
+                        &mapping[expert * batch..expert * batch + expected.len()],
+                        expected
+                    );
+                    expected_tiles += expected.len().div_ceil(32);
+                }
+                assert_eq!(tiles[0] as usize, expected_tiles);
             }
-            for (actual, expected) in output.to_host_vec(&stream)?.iter().zip(expected) {
-                assert!(
-                    (actual - expected).abs() < 1e-4 * expected.abs().max(1.0),
-                    "output batch={batch}: {actual} != {expected}"
-                );
-            }
-            let counts = work.counts.to_host_vec(&stream)?;
-            let mapping = work.choices.to_host_vec(&stream)?;
-            let tiles = work.tiles.to_host_vec(&stream)?;
-            let mut expected_tiles = 0;
-            for expert in 0..256 {
-                let expected = selected
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &id)| (id as usize == expert).then_some(i as u32))
-                    .collect::<Vec<_>>();
-                assert_eq!(counts[expert] as usize, expected.len());
-                assert_eq!(
-                    &mapping[expert * batch..expert * batch + expected.len()],
-                    expected
-                );
-                expected_tiles += expected.len().div_ceil(16);
-            }
-            assert_eq!(tiles[0] as usize, expected_tiles);
         }
         Ok(())
     }

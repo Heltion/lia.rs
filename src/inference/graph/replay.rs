@@ -189,12 +189,7 @@ impl Engine {
         };
         let matches = eligible
             && self.position == replay.next
-            && attention_plan::plan(
-                1,
-                self.position + 1,
-                self.attention_mma_decode,
-                self.attention_query_tiles,
-            ) == replay.layout
+            && self.attention_layout(1, self.position + 1) == replay.layout
             && self
                 .last_hidden
                 .as_ref()

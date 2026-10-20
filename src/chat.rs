@@ -1,7 +1,5 @@
 //! Rendering the model-provided chat template and parsing its tool-call format.
 use crate::gguf::{Model, Value};
-#[cfg(any(feature = "cuda", test))]
-use anyhow::Context;
 use anyhow::{Result, anyhow};
 use serde_json::{Value as Json, json};
 
@@ -72,6 +70,11 @@ pub fn render_template(template: &str, request: &Json) -> Result<String> {
         .as_array_mut()
         .ok_or_else(|| anyhow!("invalid messages"))?
     {
+        if message["role"] == "assistant"
+            && let Some(reasoning) = message.get("reasoning").filter(|v| v.is_string())
+        {
+            message["reasoning_content"] = reasoning.clone();
+        }
         if let Some(calls) = message.get_mut("tool_calls").and_then(Json::as_array_mut) {
             for call in calls {
                 if let Some(arguments) = call
@@ -143,13 +146,11 @@ pub fn parse(raw: &str, tools: &Json) -> Result<Json> {
             .find_map(|t| {
                 let f = t.get("function")?;
                 (f.get("name")?.as_str()? == name).then_some(f)
-            })
-            .ok_or_else(|| anyhow!("unknown model tool {name}"))?;
+            });
         let parameters = definition
-            .get("parameters")
+            .and_then(|f| f.get("parameters"))
             .and_then(|p| p.get("properties"))
-            .and_then(Json::as_object)
-            .ok_or_else(|| anyhow!("missing tool parameter schema"))?;
+            .and_then(Json::as_object);
         let mut args = serde_json::Map::new();
         let mut params = &func[name_end + 1..];
         while let Some(start) = params.find("<parameter=") {
@@ -166,36 +167,23 @@ pub fn parse(raw: &str, tools: &Json) -> Result<Json> {
                 + 1;
             let text = params[key_end + 1..value_end].trim();
             let kind = parameters
-                .get(key)
+                .and_then(|p| p.get(key))
                 .and_then(|p| p.get("type"))
                 .and_then(Json::as_str)
-                .ok_or_else(|| anyhow!("unknown parameter {key}"))?;
+                .unwrap_or("string");
             let value = match kind {
                 "string" => Json::String(text.to_owned()),
                 "boolean" if text == "True" || text == "False" => Json::Bool(text == "True"),
                 _ if text == "None" => Json::Null,
-                _ => serde_json::from_str(text)
-                    .with_context(|| format!("invalid {kind} value for {name}.{key}: {text:?}"))?,
+                _ => serde_json::from_str(text).unwrap_or_else(|_| Json::String(text.to_owned())),
             };
             if args.insert(key.to_owned(), value).is_some() {
                 return Err(anyhow!("duplicate tool parameter"));
             }
             params = &params[value_end + "</parameter>".len()..];
         }
-        if let Some(required) = definition
-            .get("parameters")
-            .and_then(|p| p.get("required"))
-            .and_then(Json::as_array)
-        {
-            for key in required {
-                if !args.contains_key(
-                    key.as_str()
-                        .ok_or_else(|| anyhow!("invalid required parameter"))?,
-                ) {
-                    return Err(anyhow!("missing required tool parameter"));
-                }
-            }
-        }
+        // Schema mistakes are generated model output, not malformed API requests.
+        // Preserve them for the caller's tool execution and error feedback.
         calls.push(json!({"id":format!("lia_call_{}",calls.len()),"type":"function","function":{"name":name,"arguments":serde_json::to_string(&args)?}}));
         remainder = &remainder[end + "</tool_call>".len()..];
     }
@@ -210,6 +198,26 @@ pub fn parse(raw: &str, tools: &Json) -> Result<Json> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn assistant_reasoning_fields_render_identically() -> Result<()> {
+        let template = "{% for m in messages %}{{ m.reasoning_content|default('') }}:{{ m.content }}{% endfor %}";
+        let old = json!({"messages":[{"role":"assistant","content":"answer","reasoning_content":"thought"}]});
+        let modern =
+            json!({"messages":[{"role":"assistant","content":"answer","reasoning":"thought"}]});
+        assert_eq!(render_template(template, &old)?, "thought:answer");
+        assert_eq!(
+            render_template(template, &modern)?,
+            render_template(template, &old)?
+        );
+        let both = json!({"messages":[{"role":"assistant","content":"answer","reasoning":"current","reasoning_content":"old"}]});
+        assert_eq!(render_template(template, &both)?, "current:answer");
+        let null = json!({"messages":[{"role":"assistant","content":"answer","reasoning":null,"reasoning_content":"thought"}]});
+        assert_eq!(
+            render_template(template, &null)?,
+            render_template(template, &old)?
+        );
+        Ok(())
+    }
     #[test]
     fn tool_values_and_thinking() {
         let tools = json!([{"type":"function","function":{"name":"f","parameters":{"properties":{"s":{"type":"string"},"n":{"type":"integer"}},"required":["s","n"]}}}]);
@@ -237,5 +245,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args, json!({"enabled":false,"value":null}));
+    }
+    #[test]
+    fn generated_schema_errors_remain_tool_calls() -> Result<()> {
+        let tools = json!([{"type":"function","function":{"name":"cd","parameters":{
+            "properties":{"folder":{"type":"string"},"count":{"type":"integer"}},
+            "required":["folder"]}}}]);
+        let raw = "</think><tool_call><function=cd><parameter=path>..</parameter><parameter=count>not a number</parameter></function></tool_call>";
+        let parsed = parse(raw, &tools)?;
+        let call = &parsed["tool_calls"][0]["function"];
+        let args: Json = serde_json::from_str(call["arguments"].as_str().unwrap())?;
+        assert_eq!(call["name"], "cd");
+        assert_eq!(args, json!({"path":"..","count":"not a number"}));
+        let unknown = parse(
+            "<tool_call><function=unknown><parameter=x>raw value</parameter></function></tool_call>",
+            &tools,
+        )?;
+        assert_eq!(unknown["tool_calls"][0]["function"]["name"], "unknown");
+        Ok(())
     }
 }

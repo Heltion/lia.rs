@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 
 impl Engine {
     pub fn synchronize(&self) -> Result<()> {
@@ -83,6 +84,16 @@ impl Engine {
             .ok_or_else(|| anyhow!("no target hidden state"))?;
         let logits = self.mm("output.weight", hidden)?;
         Ok(self.greedy(&logits)?[0])
+    }
+    /// Read raw next-token scores without advancing or modifying cached state.
+    pub fn current_logits(&self) -> Result<Vec<f32>> {
+        let hidden = self
+            .last_hidden
+            .as_ref()
+            .ok_or_else(|| anyhow!("no target hidden state"))?;
+        self.mm("output.weight", hidden)?
+            .to_host_vec(&self.stream)
+            .context("reading current target logits from GPU")
     }
     pub(super) fn copy(&self, input: &DeviceBuffer<f32>) -> Result<DeviceBuffer<f32>> {
         let mut out = DeviceBuffer::zeroed(&self.stream, input.len())?;

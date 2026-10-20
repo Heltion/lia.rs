@@ -64,12 +64,17 @@ impl Loader<'_> {
             tensor.dtype == Dtype::Bf16 && tensor.shape == shape,
             "invalid BF16 tensor {name}"
         );
+        let bytes = super::layout::rows(name, self.archive.read(name)?, shape[0]);
+        let data = if name == "model.language_model.embed_tokens.weight"
+            && std::env::var("LIA_HOST_EMBEDDING").as_deref() == Ok("1")
+        {
+            crate::inference::host_weights::allocate(self.stream.context(), &bytes)?
+        } else {
+            DeviceBuffer::from_host(self.stream, &bytes)?
+        };
         Ok(Weight {
             group: None,
-            data: DeviceBuffer::from_host(
-                self.stream,
-                &super::layout::rows(name, self.archive.read(name)?, shape[0]),
-            )?,
+            data,
             floats: None,
             shape: shape.iter().rev().copied().collect(),
             kind: 30,

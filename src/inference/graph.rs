@@ -2,6 +2,7 @@
 use super::*;
 use anyhow::Context;
 use cuda_core::sys;
+pub(super) mod branch;
 pub(super) mod replay;
 
 fn check(status: sys::CUresult, operation: &str) -> Result<()> {
@@ -155,12 +156,7 @@ impl Engine {
                 self._context.clone(),
                 hidden,
                 self.position - 1,
-                attention_plan::plan(
-                    1,
-                    self.position,
-                    self.attention_mma_decode,
-                    self.attention_query_tiles,
-                ),
+                self.attention_layout(1, self.position),
             )?;
             replay.exec.launch(&self.stream)?;
             *self.decode_replay.borrow_mut() = Some(replay);
