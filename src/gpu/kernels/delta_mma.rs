@@ -1,42 +1,43 @@
-//! Shared BF16 high/residual operands for f32 recurrent matrix products.
+//! Exact shared f32 operands with high/residual TF32 matrix products.
 use cuda_device::{convert, wmma};
 
 #[derive(Clone, Copy)]
 pub(super) struct Matrix {
-    hi: *mut u32,
-    lo: *mut u32,
+    even: *mut u32,
+    odd: *mut u32,
     stride: u32,
 }
 
 impl Matrix {
     #[inline(always)]
-    pub(super) unsafe fn at(tile: *mut u32, hi: usize, lo: usize, stride: u32) -> Self {
+    pub(super) unsafe fn at(tile: *mut u32, even: usize, odd: usize, stride: u32) -> Self {
         Self {
-            hi: unsafe { tile.add(hi) },
-            lo: unsafe { tile.add(lo) },
+            even: unsafe { tile.add(even) },
+            odd: unsafe { tile.add(odd) },
             stride,
         }
     }
 
     #[inline(always)]
     pub(super) unsafe fn store_pair(self, row: u32, col: u32, a: f32, b: f32) {
-        let hi = convert::cvt_bf16x2_f32(a, b);
-        let (ah, bh) = convert::cvt_f32x2_bf16x2(hi);
-        let lo = convert::cvt_bf16x2_f32(a - ah, b - bh);
         let index = ((row * self.stride + col) / 2) as usize;
-        // SAFETY: each producer owns a complete aligned pair in both planes.
+        // SAFETY: each producer owns an aligned pair in two disjoint planes.
         unsafe {
-            self.hi.add(index).write(hi);
-            self.lo.add(index).write(lo);
+            self.even.add(index).write(a.to_bits());
+            self.odd.add(index).write(b.to_bits());
         }
     }
 
     #[inline(always)]
-    pub(super) unsafe fn read_pair(self, row: u32, col: u32) -> (f32, f32) {
+    pub(super) unsafe fn value(self, row: u32, col: u32) -> f32 {
         let index = ((row * self.stride + col) / 2) as usize;
-        let (ah, bh) = unsafe { convert::cvt_f32x2_bf16x2(*self.hi.add(index)) };
-        let (al, bl) = unsafe { convert::cvt_f32x2_bf16x2(*self.lo.add(index)) };
-        (ah + al, bh + bl)
+        let plane = if col % 2 == 0 { self.even } else { self.odd };
+        unsafe { f32::from_bits(*plane.add(index)) }
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn read_pair(self, row: u32, col: u32) -> (f32, f32) {
+        unsafe { (self.value(row, col), self.value(row, col + 1)) }
     }
 
     #[inline(always)]
@@ -51,55 +52,14 @@ impl Matrix {
 }
 
 #[inline(always)]
-unsafe fn load_a<const TRANS: bool>(
-    matrix: Matrix,
-    low: bool,
-    row: u32,
-    k: u32,
-    lane: u32,
-) -> [u32; 4] {
-    let plane = if low { matrix.lo } else { matrix.hi };
-    let (r, c) = if TRANS {
-        (k + lane % 8 + (lane / 16) * 8, row + ((lane / 8) % 2) * 8)
-    } else {
-        (row + lane % 16, k + (lane / 16) * 8)
-    };
-    let ptr = unsafe { plane.add(((r * matrix.stride + c) / 2) as usize) };
-    unsafe {
-        if TRANS {
-            wmma::ldmatrix_x4_trans(ptr)
-        } else {
-            wmma::ldmatrix_x4(ptr)
-        }
-    }
+fn split(value: f32) -> (u32, u32) {
+    let high = convert::cvt_rn_tf32_f32(value);
+    let low = convert::cvt_rn_tf32_f32(value - f32::from_bits(high));
+    (high, low)
 }
 
-#[inline(always)]
-unsafe fn load_b<const TRANS: bool>(
-    matrix: Matrix,
-    low: bool,
-    col: u32,
-    k: u32,
-    lane: u32,
-) -> [u32; 2] {
-    let plane = if low { matrix.lo } else { matrix.hi };
-    let (r, c) = if TRANS {
-        (k + lane % 16, col)
-    } else {
-        (col + lane % 8, k + ((lane / 8) % 2) * 8)
-    };
-    let ptr = unsafe { plane.add(((r * matrix.stride + c) / 2) as usize) };
-    unsafe {
-        if TRANS {
-            wmma::ldmatrix_x2_trans(ptr)
-        } else {
-            wmma::ldmatrix_x2(ptr)
-        }
-    }
-}
-
-/// B is addressed as B-transpose unless TB is true. Keep both first-order
-/// residual products, with the persistent accumulator always remaining f32.
+/// TF32 fragment coordinates follow the PTX mma.m16n8k8 layout. Keep exact
+/// shared operands and all four products of their high/residual components.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn product<const K: u32, const TA: bool, const TB: bool>(
@@ -112,16 +72,33 @@ pub(super) unsafe fn product<const K: u32, const TA: bool, const TB: bool>(
 ) -> [f32; 4] {
     let mut k = 0;
     while k < K {
-        unsafe {
-            let ah = load_a::<TA>(a, false, row, k, lane);
-            let al = load_a::<TA>(a, true, row, k, lane);
-            let bh = load_b::<TB>(b, false, col, k, lane);
-            let bl = load_b::<TB>(b, true, col, k, lane);
-            sum = wmma::mma_m16n8k16_f32_bf16(sum, al, bh);
-            sum = wmma::mma_m16n8k16_f32_bf16(sum, ah, bl);
-            sum = wmma::mma_m16n8k16_f32_bf16(sum, ah, bh);
+        let mut ah = [0u32; 4];
+        let mut al = [0u32; 4];
+        let mut bh = [0u32; 2];
+        let mut bl = [0u32; 2];
+        let mut i = 0;
+        while i < 4 {
+            let r = row + lane / 4 + (i % 2) * 8;
+            let c = k + lane % 4 + (i / 2) * 4;
+            let value = unsafe { if TA { a.value(c, r) } else { a.value(r, c) } };
+            (ah[i as usize], al[i as usize]) = split(value);
+            i += 1;
         }
-        k += 16;
+        i = 0;
+        while i < 2 {
+            let r = k + lane % 4 + i * 4;
+            let c = col + lane / 4;
+            let value = unsafe { if TB { b.value(r, c) } else { b.value(c, r) } };
+            (bh[i as usize], bl[i as usize]) = split(value);
+            i += 1;
+        }
+        unsafe {
+            sum = wmma::mma_m16n8k8_f32_tf32(sum, al, bl);
+            sum = wmma::mma_m16n8k8_f32_tf32(sum, al, bh);
+            sum = wmma::mma_m16n8k8_f32_tf32(sum, ah, bl);
+            sum = wmma::mma_m16n8k8_f32_tf32(sum, ah, bh);
+        }
+        k += 8;
     }
     sum
 }

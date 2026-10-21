@@ -3,13 +3,47 @@ use super::*;
 use anyhow::Context;
 
 const MIB: usize = 1024 * 1024;
-const RESERVE: usize = 768 * MIB;
+const RESERVE: usize = 512 * MIB;
 const SMALL_ELEMENTS: usize = 48 * 17408 * 8 + 2 * 248320 * 8;
 
-fn reservation(batch: usize, attention: usize) -> (usize, usize, usize) {
-    let scratch = (2 * 17408 + 4 * 6144 + 3 * 5120 + 4 * 1024) * batch * 4 + SMALL_ELEMENTS * 4;
-    let packed = batch * 17408 * 2;
-    (scratch, attention, packed)
+fn scratch_layout(geometry: geometry::Geometry, batch: usize) -> Vec<(usize, usize)> {
+    if geometry.moe {
+        vec![
+            (8 * geometry.hidden * batch, 1),
+            (geometry.recurrent_width() * batch, 2),
+            (geometry.value_heads * 128 * batch, 3),
+            (geometry.hidden * batch, 6),
+            (512 * batch, 4),
+            (256 * batch, 1),
+        ]
+    } else {
+        vec![
+            (17408 * batch, 2),
+            (6144 * batch, 4),
+            (5120 * batch, 3),
+            (1024 * batch, 4),
+        ]
+    }
+}
+
+fn reservation(
+    geometry: geometry::Geometry,
+    batch: usize,
+    attention: usize,
+) -> (usize, usize, usize) {
+    let scratch = scratch_layout(geometry, batch)
+        .into_iter()
+        .map(|(elements, count)| elements * count * 4)
+        .sum::<usize>()
+        + SMALL_ELEMENTS * 4;
+    // Dense projections need one FP16 plane. INT4 experts also preserve the
+    // FP16 residual of their larger routed activation in the same workspace.
+    let packed_words = if geometry.moe {
+        geometry.recurrent_width() / 2
+    } else {
+        17408 / 2
+    };
+    (scratch, attention, batch * packed_words * 4)
 }
 
 impl Engine {
@@ -32,7 +66,7 @@ impl Engine {
                     });
                 }
             }
-            let parts = 248320usize.div_ceil(1024);
+            let parts = self.vocabulary_size().div_ceil(1024);
             self.greedy_work
                 .insert(batch, DeviceBuffer::zeroed(&self.stream, batch * parts)?);
             sampling.insert(
@@ -62,30 +96,36 @@ impl Engine {
             attention_plan::reserved_bytes(
                 batch,
                 self.capacity,
+                self.geometry.query_heads,
                 self.attention_mma_decode,
                 self.attention_query_tiles,
             )
         };
+        // Leave space for the server checkpoint and driver allocations after
+        // reserving scratch. Draft state itself was allocated during initialization.
+        let reserve = if self.geometry.mtp {
+            RESERVE
+        } else {
+            256 * MIB
+        };
         let maximum = self.prefill_batch.min(self.capacity);
-        let batch = [4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 1]
+        let batch = [
+            4096, 3072, 2048, 1536, 1024, 768, 512, 384, 256, 192, 128, 64, 32, 16, 8, 4, 1,
+        ]
             .into_iter()
             .filter(|&n| n <= maximum)
             .find(|&n| {
-                let (scratch, attention, packed) = reservation(n, attention_bytes(n));
-                scratch + attention + packed + RESERVE <= free
+                let (scratch, attention, packed) = reservation(self.geometry, n, attention_bytes(n));
+                scratch + attention + packed + reserve <= free
             })
-            .ok_or_else(|| anyhow!("insufficient CUDA headroom to reserve inference buffers"))?;
-        let (scratch, attention, packed) = reservation(batch, attention_bytes(batch));
+            .ok_or_else(|| anyhow!("insufficient CUDA headroom to reserve inference buffers: free={free}, reserve={reserve}"))?;
+        let (scratch, attention, packed) =
+            reservation(self.geometry, batch, attention_bytes(batch));
         {
             let mut pool = self.pool.borrow_mut();
-            for (elements, count) in [
-                (17408 * batch, 2),
-                (6144 * batch, 4),
-                (5120 * batch, 3),
-                (1024 * batch, 4),
-                (17408 * 8, 48),
-                (248320 * 8, 2),
-            ] {
+            let mut layout = scratch_layout(self.geometry, batch);
+            layout.extend([(17408 * 8, 48), (self.vocabulary_size() * 8, 2)]);
+            for (elements, count) in layout {
                 let buffers = pool.entry(elements).or_default();
                 for _ in 0..count {
                     buffers.push(
@@ -134,7 +174,7 @@ impl Engine {
     pub(crate) fn prepare_checkpoint(&self) -> Result<Snapshot> {
         let mut checkpoint = self.snapshot()?;
         if checkpoint.hidden.is_none() {
-            checkpoint.hidden = Some(DeviceBuffer::zeroed(&self.stream, 5120)?);
+            checkpoint.hidden = Some(DeviceBuffer::zeroed(&self.stream, self.geometry.hidden)?);
         }
         Ok(checkpoint)
     }
@@ -147,7 +187,7 @@ impl Engine {
     }
 
     pub fn query_tiled_attention(&self) -> bool {
-        self.attention_query_tiles
+        self.attention_query_tiles != 0
     }
 
     pub fn gdn_parallel(&self) -> bool {
@@ -168,8 +208,9 @@ mod tests {
     #[test]
     fn reservation_sizes_cover_decode_and_grow_with_prefill() {
         let mut previous = 0;
-        for batch in [64, 512, 1024, 2048, 4096] {
-            let (scratch, attention, packed) = reservation(batch, 128 * MIB);
+        for batch in [64, 192, 384, 768, 1024, 1536, 2048, 3072, 4096] {
+            let (scratch, attention, packed) =
+                reservation(geometry::Geometry::dense(), batch, 128 * MIB);
             assert!(attention >= 128 * MIB);
             assert!(scratch + attention + packed > previous);
             assert_eq!(packed, batch * 17408 * 2);

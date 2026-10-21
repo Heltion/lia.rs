@@ -3,6 +3,10 @@ use anyhow::Context;
 
 impl Engine {
     pub(super) fn weight(&self, name: &str) -> Result<&Weight> {
+        anyhow::ensure!(
+            !self.kv_offloaded || name.starts_with("vision."),
+            "attention cache is offloaded; language execution is unavailable"
+        );
         self.weights
             .get(name)
             .ok_or_else(|| anyhow!("missing tensor {name}"))
@@ -69,7 +73,9 @@ impl Engine {
         let mut output = self.zeros(rows * batch)?;
         // SAFETY: validated matrix layout, matching input and allocated output;
         // every warp has one disjoint output row.
-        if batch >= crate::gpu::WIDE_MIN_BATCH
+        if w.group.is_some() {
+            self.gsq_mm(w, input, reuse_input, &mut output)?;
+        } else if batch >= crate::gpu::WIDE_MIN_BATCH
             && let Some(weight_scale) = w.fp8_scale
         {
             let mut work = self.fp8_work.borrow_mut();
@@ -123,6 +129,55 @@ impl Engine {
                     None
                 },
             )?;
+        } else if w.kind == 30 && rows == 256 && cols.is_multiple_of(128) {
+            // Keep router operands in FP32 across single-token and batched paths.
+            anyhow::ensure!(
+                rows.checked_mul(cols).and_then(|n| n.checked_mul(2)) == Some(w.data.len()),
+                "invalid BF16 router weight extent"
+            );
+            // SAFETY: complete aligned BF16 rows and 128-column groups. Each
+            // full warp preserves the original lane FMA and reduction order.
+            unsafe {
+                self.module.bf16_router.bf16_router_matvec(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: ((rows * batch * 32).div_ceil(64) as u32, 1, 1),
+                        block_dim: (64, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    cols,
+                    rows,
+                    batch,
+                    &w.data,
+                    input,
+                    output.cu_deviceptr() as *mut f32,
+                )?;
+            }
+        } else if w.kind == 30 && rows <= 96 {
+            let parts = cols.div_ceil(256);
+            let partial = self.zeros(parts * rows * batch)?;
+            // SAFETY: the checked BF16 matrix has exactly two bytes per value;
+            // each partition and output row has a disjoint warp producer.
+            unsafe {
+                self.module.matrix.bf16_partial(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((parts * rows * batch * 32) as u32),
+                    cols,
+                    rows,
+                    batch,
+                    parts,
+                    &w.data,
+                    input,
+                    partial.cu_deviceptr() as *mut f32,
+                )?;
+                self.module.matrix.bf16_merge(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((rows * batch * 32) as u32),
+                    parts,
+                    &partial,
+                    output.cu_deviceptr() as *mut f32,
+                )?;
+            }
         } else if batch > 8 {
             let mut packed = self.prefill_input.borrow_mut();
             if packed
@@ -151,31 +206,6 @@ impl Engine {
                     packed,
                     output.cu_deviceptr() as *mut f32,
                     self.prefill_tile,
-                )?;
-            }
-        } else if w.kind == 30 && rows <= 96 {
-            let parts = cols.div_ceil(256);
-            let partial = self.zeros(parts * rows * batch)?;
-            // SAFETY: the checked BF16 matrix has exactly two bytes per value;
-            // each partition and output row has a disjoint warp producer.
-            unsafe {
-                self.module.matrix.bf16_partial(
-                    &self.stream,
-                    LaunchConfig::for_num_elems((parts * rows * batch * 32) as u32),
-                    cols,
-                    rows,
-                    batch,
-                    parts,
-                    &w.data,
-                    input,
-                    partial.cu_deviceptr() as *mut f32,
-                )?;
-                self.module.matrix.bf16_merge(
-                    &self.stream,
-                    LaunchConfig::for_num_elems((rows * batch * 32) as u32),
-                    parts,
-                    &partial,
-                    output.cu_deviceptr() as *mut f32,
                 )?;
             }
         } else if self.integer && w.kind != 0 && w.kind != 30 {

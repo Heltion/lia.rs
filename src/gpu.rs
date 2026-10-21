@@ -1,6 +1,9 @@
 //! Rust GPU operators and host launch validation.
 use anyhow::anyhow;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, simt::LaunchConfig};
+#[cfg(test)]
+mod attention_compact;
+pub(crate) mod attention_wide;
 mod dispatch;
 mod inspection;
 pub(crate) mod kernels;
@@ -13,6 +16,9 @@ pub(crate) const MAX_PREFILL_BATCH: usize = 4096;
 
 pub(crate) mod fp8;
 pub(crate) mod fp8_cache;
+pub(crate) mod gsq;
+pub(crate) mod gsq_tensor;
+pub(crate) mod moe;
 mod tensor;
 pub(crate) use tensor::launch_prefill_matrix;
 pub(crate) use tensor::{MEDIUM_MIN_BATCH, WIDE_MIN_BATCH};
@@ -328,3 +334,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod attention_bf16;

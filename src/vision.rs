@@ -7,7 +7,8 @@ use std::io::Cursor;
 mod plan;
 mod positions;
 pub use plan::PositionPlan;
-mod resize;
+mod huggingface;
+pub(crate) mod resize;
 pub use positions::ImageGrid;
 
 pub struct PreparedImage {
@@ -103,38 +104,12 @@ impl Processor {
     }
 
     pub fn prepare_data_url(&self, url: &str) -> Result<PreparedImage> {
-        let (header, data) = url
-            .split_once(',')
-            .ok_or_else(|| anyhow!("invalid image data URL"))?;
-        let format = match header {
-            "data:image/png;base64" => image::ImageFormat::Png,
-            "data:image/jpeg;base64" => image::ImageFormat::Jpeg,
-            _ => return Err(anyhow!("expected a PNG or JPEG base64 data URL")),
-        };
-        let bytes = STANDARD.decode(data).context("decoding image base64")?;
-        ensure!(
-            image::guess_format(&bytes)? == format,
-            "image MIME type does not match its data"
-        );
+        let bytes = data_url_bytes(url)?;
         self.prepare(&bytes)
     }
 
     pub fn prepare(&self, bytes: &[u8]) -> Result<PreparedImage> {
-        let format = image::guess_format(bytes).context("identifying image format")?;
-        ensure!(
-            matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg),
-            "only PNG and JPEG images are supported"
-        );
-        let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
-        let mut limits = image::Limits::default();
-        limits.max_image_width = Some(16384);
-        limits.max_image_height = Some(16384);
-        limits.max_alloc = Some(256 * 1024 * 1024);
-        reader.limits(limits);
-        let decoded = reader
-            .decode()
-            .context("decoding image pixels")?
-            .into_rgb8();
+        let decoded = decode(bytes)?;
         let (w, h) = (decoded.width() as usize, decoded.height() as usize);
         let (width, height) = self.dimensions(w, h)?;
         let rgb = resize::bicubic(decoded.as_raw(), w, h, width, height);
@@ -152,6 +127,43 @@ impl Processor {
             pixels,
         })
     }
+}
+
+pub(crate) fn data_url_bytes(url: &str) -> Result<Vec<u8>> {
+    let (header, data) = url
+        .split_once(',')
+        .ok_or_else(|| anyhow!("invalid image data URL"))?;
+    let format = match header {
+        "data:image/png;base64" => image::ImageFormat::Png,
+        "data:image/jpeg;base64" => image::ImageFormat::Jpeg,
+        _ => return Err(anyhow!("expected a PNG or JPEG base64 data URL")),
+    };
+    let bytes = STANDARD.decode(data).context("decoding image base64")?;
+    ensure!(
+        image::guess_format(&bytes)? == format,
+        "image MIME type does not match its data"
+    );
+    Ok(bytes)
+}
+
+/// Shared bounded RGB decoding; model processors own resizing and layout rules.
+pub(crate) fn decode(bytes: &[u8]) -> Result<image::RgbImage> {
+    let format = image::guess_format(bytes).context("identifying image format")?;
+    ensure!(
+        matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg),
+        "only PNG and JPEG images are supported"
+    );
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .context("decoding image pixels")?
+        .into_rgb8();
+    Ok(decoded)
 }
 
 #[cfg(test)]

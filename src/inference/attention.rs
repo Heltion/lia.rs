@@ -2,6 +2,16 @@ use super::*;
 use anyhow::Context;
 
 impl Engine {
+    pub(super) fn attention_layout(&self, batch: usize, tokens: usize) -> attention_plan::Plan {
+        attention_plan::plan_with_decode_span(
+            batch,
+            tokens,
+            self.attention_mma_decode,
+            self.attention_query_tiles,
+            self.attention_decode_span,
+        )
+    }
+
     pub(super) fn full_attention(&self, layer: usize, x: &DeviceBuffer<f32>) -> Result<Buffer> {
         self.full_attention_at(layer, x, self.position, false)?
             .ok_or_else(|| anyhow!("missing attention output"))
@@ -13,7 +23,7 @@ impl Engine {
         position: usize,
         cache_only: bool,
     ) -> Result<Option<Buffer>> {
-        let batch = x.len() / 5120;
+        let batch = x.len() / self.geometry.hidden;
         let prefix = format!("blk.{layer}");
         let (qgate, kraw, v) = if cache_only {
             let [k, v] = self.mm_many(
@@ -35,19 +45,14 @@ impl Engine {
             )?;
             (Some(q), k, v)
         };
-        let q = self.zeros(batch * 6144)?;
-        let k = self.zeros(batch * 1024)?;
-        let layout = attention_plan::plan(
-            batch,
-            position + batch,
-            self.attention_mma_decode,
-            self.attention_query_tiles,
-        );
+        let q = self.zeros(batch * (self.geometry.query_heads * 256))?;
+        let k = self.zeros(batch * (self.geometry.kv_heads * 256))?;
+        let layout = self.attention_layout(batch, position + batch);
         let tensor = layout.tensor;
         let span = layout.span;
         let parts = layout.parts;
         let cap_parts = parts;
-        let required = layout.queries * 24 * cap_parts * 258;
+        let required = layout.queries * self.geometry.query_heads * cap_parts * 258;
         let mut workspace = self.attention_work.borrow_mut();
         if workspace
             .as_ref()
@@ -69,7 +74,7 @@ impl Engine {
         let partial = workspace
             .as_ref()
             .ok_or_else(|| anyhow!("missing attention workspace"))?;
-        let attended = self.zeros(batch * 6144)?;
+        let attended = self.zeros(batch * (self.geometry.query_heads * 256))?;
         let State::Attention { k: kc, v: vc } = &self.states[layer] else {
             return Err(anyhow!("invalid attention layer state"));
         };
@@ -113,9 +118,9 @@ impl Engine {
             if let Some(qgate) = &qgate {
                 self.module.rotary.norm_rope_cached(
                     &self.stream,
-                    LaunchConfig::for_num_elems((batch * 24 * 32) as u32),
+                    LaunchConfig::for_num_elems((batch * self.geometry.query_heads * 32) as u32),
                     256,
-                    24,
+                    self.geometry.query_heads,
                     512,
                     64,
                     self.eps,
@@ -127,9 +132,9 @@ impl Engine {
             }
             self.module.rotary.norm_rope_cached(
                 &self.stream,
-                LaunchConfig::for_num_elems((batch * 4 * 32) as u32),
+                LaunchConfig::for_num_elems((batch * self.geometry.kv_heads * 32) as u32),
                 256,
-                4,
+                self.geometry.kv_heads,
                 256,
                 64,
                 self.eps,
@@ -140,8 +145,8 @@ impl Engine {
             )?;
             self.module.rotary.cache_kv_half(
                 &self.stream,
-                LaunchConfig::for_num_elems((batch * 1024) as u32),
-                1024,
+                LaunchConfig::for_num_elems((batch * (self.geometry.kv_heads * 256)) as u32),
+                self.geometry.kv_heads * 256,
                 position,
                 &k,
                 &v,
@@ -155,9 +160,11 @@ impl Engine {
                 ($tile:literal) => {{
                     self.module.flash_half.flash_partial_half::<256, $tile>(
                         &self.stream,
-                        LaunchConfig::for_num_elems((batch * 24 * parts * 32) as u32),
-                        24,
-                        4,
+                        LaunchConfig::for_num_elems(
+                            (batch * self.geometry.query_heads * parts * 32) as u32,
+                        ),
+                        self.geometry.query_heads,
+                        self.geometry.kv_heads,
                         tokens,
                         parts,
                         cap_parts,
@@ -172,24 +179,27 @@ impl Engine {
                 let query_count = (batch - query_start).min(layout.queries);
                 if tensor {
                     macro_rules! tensor_attention {
-                        ($grouped:literal, $heads:expr, $queries:expr) => {{
-                            self.module.flash_mma.flash_mma::<$grouped>(
-                                &self.stream,
-                                LaunchConfig {
-                                    grid_dim: (
-                                        ($queries.div_ceil(16) * $heads * parts) as u32,
-                                        1,
-                                        1,
+                        ($grouped:literal, $reuse:literal, $rows:literal, $heads:expr, $queries:expr) => {{
+                            let prepared = self
+                                .module
+                                .flash_mma
+                                .prepare_flash_mma::<$grouped, $reuse, $rows>(
+                                    cuda_core::simt::LaunchConfig1D::new(
+                                        ($queries.div_ceil($rows) * $heads * parts) as u32,
+                                        $rows * 16,
+                                        if $rows == 32 { 60160 } else { 0 },
                                     ),
-                                    block_dim: (256, 1, 1),
-                                    shared_mem_bytes: 0,
-                                },
-                                24,
-                                4,
+                                )?;
+                            self.module.flash_mma.flash_mma::<$grouped, $reuse, $rows>(
+                                &self.stream,
+                                &prepared,
+                                self.geometry.query_heads,
+                                self.geometry.kv_heads,
                                 tokens,
                                 span,
                                 parts,
                                 query_start,
+                                query_count,
                                 &q,
                                 kc,
                                 vc,
@@ -198,28 +208,94 @@ impl Engine {
                         }};
                     }
                     if batch <= 8 {
-                        tensor_attention!(true, 4, (batch * 6));
+                        tensor_attention!(
+                            true,
+                            false,
+                            16,
+                            self.geometry.kv_heads,
+                            (batch * (self.geometry.query_heads / self.geometry.kv_heads))
+                        );
+                    } else if tokens > 2048 && self.attention_query_tiles == 64 {
+                        crate::gpu::attention_wide::launch::<false>(
+                            &self.module,
+                            &self.stream,
+                            self.geometry.query_heads,
+                            self.geometry.kv_heads,
+                            tokens,
+                            span,
+                            parts,
+                            query_start,
+                            query_count,
+                            &q,
+                            kc,
+                            vc,
+                            partial,
+                        )?;
+                    } else if tokens > 2048 {
+                        tensor_attention!(false, true, 32, self.geometry.query_heads, query_count);
                     } else {
-                        tensor_attention!(false, 24, query_count);
+                        tensor_attention!(false, false, 16, self.geometry.query_heads, query_count);
                     }
                 } else if span == 64 {
                     attention!(64);
                 } else {
                     attention!(128);
                 }
-                self.module.attention.flash_merge::<256>(
-                    &self.stream,
-                    LaunchConfig::for_num_elems((query_count * 24 * 32) as u32),
-                    query_count * 24,
-                    parts,
-                    cap_parts,
-                    query_start * 24,
-                    partial,
-                    qgate
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("missing attention query"))?,
-                    attended.cu_deviceptr() as *mut f32,
-                )?;
+                if query_count <= 8 && parts >= 16 {
+                    if self.attention_merge_shared && parts <= 256 {
+                        self.module.flash_merge.flash_merge_shared(
+                            &self.stream,
+                            LaunchConfig {
+                                grid_dim: ((query_count * self.geometry.query_heads) as u32, 1, 1),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            query_count * self.geometry.query_heads,
+                            parts,
+                            cap_parts,
+                            query_start * self.geometry.query_heads,
+                            partial,
+                            qgate
+                                .as_ref()
+                                .ok_or_else(|| anyhow!("missing attention query"))?,
+                            attended.cu_deviceptr() as *mut f32,
+                        )?;
+                    } else {
+                        self.module.flash_merge.flash_merge_columns(
+                            &self.stream,
+                            LaunchConfig {
+                                grid_dim: ((query_count * self.geometry.query_heads) as u32, 1, 1),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            query_count * self.geometry.query_heads,
+                            parts,
+                            cap_parts,
+                            query_start * self.geometry.query_heads,
+                            partial,
+                            qgate
+                                .as_ref()
+                                .ok_or_else(|| anyhow!("missing attention query"))?,
+                            attended.cu_deviceptr() as *mut f32,
+                        )?;
+                    }
+                } else {
+                    self.module.attention.flash_merge::<256>(
+                        &self.stream,
+                        LaunchConfig::for_num_elems(
+                            (query_count * self.geometry.query_heads * 32) as u32,
+                        ),
+                        query_count * self.geometry.query_heads,
+                        parts,
+                        cap_parts,
+                        query_start * self.geometry.query_heads,
+                        partial,
+                        qgate
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("missing attention query"))?,
+                        attended.cu_deviceptr() as *mut f32,
+                    )?;
+                }
             }
         }
         Ok(Some(

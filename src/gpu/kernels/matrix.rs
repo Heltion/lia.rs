@@ -274,7 +274,18 @@ mod tests {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
-        let (cols, rows, batch) = (544usize, 7usize, 4usize);
+        for (cols, rows, batch) in [(544usize, 7usize, 4usize), (2048, 256, 1), (2050, 257, 3)] {
+            check_bf16(&module, &stream, cols, rows, batch)?;
+        }
+        Ok(())
+    }
+    fn check_bf16(
+        module: &kernels::LoadedModule,
+        stream: &std::sync::Arc<cuda_core::CudaStream>,
+        cols: usize,
+        rows: usize,
+        batch: usize,
+    ) -> Result<()> {
         let parts = cols.div_ceil(256);
         let bits: Vec<u16> = (0..rows * cols)
             .map(|i| {

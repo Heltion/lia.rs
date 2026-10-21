@@ -2,6 +2,8 @@
 use crate::gguf::{Model, Value};
 use anyhow::anyhow;
 use std::collections::HashMap;
+use unicode_normalization::UnicodeNormalization;
+mod huggingface;
 
 pub struct Tokenizer {
     vocab: HashMap<String, u32>,
@@ -10,6 +12,8 @@ pub struct Tokenizer {
     encode_byte: [char; 256],
     split: fancy_regex::Regex,
     special: Vec<(String, u32)>,
+    added: Vec<(String, u32)>,
+    normalize_nfc: bool,
 }
 impl Tokenizer {
     pub fn from_model(model: &Model) -> anyhow::Result<Self> {
@@ -23,6 +27,14 @@ impl Tokenizer {
                 _ => Err(anyhow!("missing array {key}")),
             }
         };
+        Self::from_arrays(
+            array("tokenizer.ggml.tokens")?,
+            array("tokenizer.ggml.token_type")?,
+            array("tokenizer.ggml.merges")?,
+        )
+    }
+
+    fn from_arrays(tokens: &[Value], types: &[Value], merges: &[Value]) -> anyhow::Result<Self> {
         let mut encode_byte = ['\0'; 256];
         let mut extra = 256;
         for b in 0..=255u32 {
@@ -43,8 +55,6 @@ impl Tokenizer {
             .enumerate()
             .map(|(b, c)| (*c, b as u8))
             .collect();
-        let tokens = array("tokenizer.ggml.tokens")?;
-        let types = array("tokenizer.ggml.token_type")?;
         if tokens.len() != types.len() {
             return Err(anyhow!("token types length mismatch"));
         }
@@ -79,7 +89,7 @@ impl Tokenizer {
         }
         special.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
         let mut ranks = HashMap::new();
-        for (rank, merge) in array("tokenizer.ggml.merges")?.iter().enumerate() {
+        for (rank, merge) in merges.iter().enumerate() {
             let Value::String(merge) = merge else {
                 return Err(anyhow!("non-string merge"));
             };
@@ -98,21 +108,28 @@ impl Tokenizer {
             encode_byte,
             split,
             special,
+            added: Vec::new(),
+            normalize_nfc: false,
         })
     }
     pub fn encode(&self, text: &str, parse_special: bool) -> anyhow::Result<Vec<u32>> {
+        let normalized = self.normalize_nfc.then(|| text.nfc().collect::<String>());
+        let text = normalized.as_deref().unwrap_or(text);
         let mut out = Vec::new();
         let mut offset = 0;
         while offset < text.len() {
-            let next = if parse_special {
-                self.special
+            let next = {
+                let recognized = if parse_special {
+                    &self.special
+                } else {
+                    &self.added
+                };
+                recognized
                     .iter()
                     .filter_map(|(s, id)| {
                         text[offset..].find(s).map(|i| (offset + i, s.len(), *id))
                     })
                     .min_by_key(|(i, len, _)| (*i, std::cmp::Reverse(*len)))
-            } else {
-                None
             };
             let end = next.map_or(text.len(), |(i, _, _)| i);
             for found in self.split.find_iter(&text[offset..end]) {

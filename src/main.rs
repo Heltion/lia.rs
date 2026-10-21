@@ -6,6 +6,47 @@ use lia::{gpu, inference, server};
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next();
+    if matches!(command.as_deref(), None | Some("--help" | "-h" | "help")) {
+        println!(
+            "lia.rs — local inference in Rust\n\nCommands:\n  inspect MODEL\n  tokenize MODEL TEXT\n  render MODEL\n  decode-block TYPE"
+        );
+        #[cfg(feature = "cuda")]
+        println!(
+            "  serve MODEL [PORT] [CONTEXT] [--mmproj PROJECTOR]\n  forward MODEL TOKEN_IDS\n  forward-batch MODEL TOKEN_IDS\n  kernel-info"
+        );
+        #[cfg(feature = "image-tools")]
+        println!("  image-tools\n  read-image INPUT [OUTPUT.png] [--time SECONDS]");
+        return Ok(());
+    }
+
+    #[cfg(feature = "image-tools")]
+    if command.as_deref() == Some("image-tools") {
+        anyhow::ensure!(args.next().is_none(), "usage: lia image-tools");
+        return lia::image_tools::serve();
+    }
+    #[cfg(feature = "image-tools")]
+    if command.as_deref() == Some("read-image") {
+        let input = args
+            .next()
+            .ok_or_else(|| anyhow!("usage: lia read-image INPUT [OUTPUT.png] [--time SECONDS]"))?;
+        let mut output = None;
+        let mut time = None;
+        while let Some(arg) = args.next() {
+            if arg == "--time" {
+                anyhow::ensure!(time.is_none(), "duplicate --time");
+                time = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("missing --time seconds"))?
+                        .parse()?,
+                );
+            } else {
+                anyhow::ensure!(output.is_none(), "unexpected argument");
+                output = Some(arg);
+            }
+        }
+        return lia::image_tools::read_cli(&input, output.as_deref(), time);
+    }
+
     #[cfg(feature = "cuda")]
     if command.as_deref() == Some("forward-batch") {
         let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
@@ -26,7 +67,7 @@ fn main() -> anyhow::Result<()> {
             tokens.len(),
             start.elapsed().as_secs_f64()
         );
-        for (position, row) in logits.as_chunks::<248320>().0.iter().enumerate() {
+        for (position, row) in logits.chunks_exact(engine.vocabulary_size()).enumerate() {
             let (token, logit) = row
                 .iter()
                 .enumerate()
@@ -80,14 +121,16 @@ fn main() -> anyhow::Result<()> {
             let mut top: Vec<_> = logits.iter().copied().enumerate().collect();
             top.sort_by(|a, b| b.1.total_cmp(&a.1));
             let next = top[0].0 as u32;
-            let draft = engine.draft(next)?;
-            let draft_next = draft
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .ok_or_else(|| anyhow!("empty draft logits"))?
-                .0;
-            eprintln!("position={position} mtp_input={next} mtp_draft={draft_next}");
+            if engine.mtp_enabled() {
+                let draft = engine.draft(next)?;
+                let draft_next = draft
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .ok_or_else(|| anyhow!("empty draft logits"))?
+                    .0;
+                eprintln!("position={position} mtp_input={next} mtp_draft={draft_next}");
+            }
             println!("position={position}");
             for (token, logit) in top.iter().take(10) {
                 println!("{token} {logit}");
@@ -101,13 +144,19 @@ fn main() -> anyhow::Result<()> {
         if args.next().is_some() {
             return Err(anyhow!("unexpected argument"));
         }
-        let model = gguf::Model::open(path)?;
         let mut input = String::new();
         std::io::stdin()
             .take(16 * 1024 * 1024)
             .read_to_string(&mut input)?;
         let request: serde_json::Value = serde_json::from_str(&input)?;
-        print!("{}", chat::render(&model, &request)?);
+        let rendered = if std::path::Path::new(&path).is_dir() {
+            let template =
+                std::fs::read_to_string(std::path::Path::new(&path).join("chat_template.jinja"))?;
+            chat::render_template(&template, &request)?
+        } else {
+            chat::render(&gguf::Model::open(path)?, &request)?
+        };
+        print!("{rendered}");
         return Ok(());
     }
     if command.as_deref() == Some("decode-block") {
@@ -134,17 +183,17 @@ fn main() -> anyhow::Result<()> {
         if args.next().is_some() {
             return Err(anyhow!("unexpected argument"));
         }
-        let model = gguf::Model::open(path)?;
-        let tokenizer = tokenizer::Tokenizer::from_model(&model)?;
+        let tokenizer = if std::path::Path::new(&path).is_dir() {
+            tokenizer::Tokenizer::from_huggingface(&path)?
+        } else {
+            tokenizer::Tokenizer::from_model(&gguf::Model::open(path)?)?
+        };
         let ids = tokenizer.encode(&text, true)?;
-        if tokenizer.decode(&ids)? != text.as_bytes() {
-            return Err(anyhow!("token round trip failed"));
-        }
         println!("{ids:?}");
         return Ok(());
     }
     if command.as_deref() != Some("inspect") {
-        return Err(anyhow!("usage: lia inspect MODEL.gguf"));
+        return Err(anyhow!("unknown command; run lia --help"));
     }
     let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
     if args.next().is_some() {

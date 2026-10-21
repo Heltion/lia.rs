@@ -121,6 +121,7 @@ impl Engine {
             self.weights.insert(
                 format!("vision.{}", tensor.name),
                 Weight {
+                    group: None,
                     data: DeviceBuffer::from_host(&self.stream, &host)?,
                     floats,
                     shape,

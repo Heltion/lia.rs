@@ -39,7 +39,7 @@ fn filters(input: usize, output: usize) -> Vec<Filter> {
         .collect()
 }
 
-pub(super) fn bicubic(
+pub(crate) fn bicubic(
     rgb: &[u8],
     width: usize,
     height: usize,

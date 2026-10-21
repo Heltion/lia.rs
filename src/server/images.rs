@@ -9,6 +9,16 @@ pub(super) struct Prompt {
     pub positions: Option<PositionPlan>,
 }
 
+/// Match preprocessing to the actual reserved encoder working set.
+pub(super) fn token_limits(engine: &Engine) -> (usize, usize) {
+    workspace_limits(engine.buffers_preallocated(), engine.prefill_batch())
+}
+
+fn workspace_limits(preallocated: bool, batch: usize) -> (usize, usize) {
+    let maximum = if preallocated { batch.min(1024) } else { 1024 };
+    (maximum.min(256), maximum)
+}
+
 fn image_sources(request: &Json) -> Result<Vec<String>> {
     let mut sources = Vec::new();
     let messages = request["messages"]
@@ -41,14 +51,9 @@ fn image_sources(request: &Json) -> Result<Vec<String>> {
 }
 
 impl Session {
-    pub(super) fn prepare_prompt(
-        &self,
-        model: &Model,
-        tokenizer: &Tokenizer,
-        request: &Json,
-    ) -> Result<Prompt> {
+    pub(super) fn prepare_prompt(&self, tokenizer: &Tokenizer, request: &Json) -> Result<Prompt> {
         let sources = image_sources(request)?;
-        let text = crate::chat::render(model, request)?;
+        let text = crate::chat::render_template(&self.template, request)?;
         let tokens = tokenizer.encode(&text, true)?;
         if sources.is_empty() {
             return Ok(Prompt {
@@ -61,7 +66,25 @@ impl Session {
         let processor = self
             .processor
             .as_ref()
-            .ok_or_else(|| anyhow!("image input requires --mmproj"))?;
+            .ok_or_else(|| anyhow!("image input requires a loaded vision model"))?;
+        let processor = match processor {
+            crate::models::image::Processor::Qwen(processor) => processor,
+            crate::models::image::Processor::MiniCpmV47 { max_slices } => {
+                let prepared = crate::models::minicpm_v47::prepare_prompt(
+                    tokenizer,
+                    tokens,
+                    &sources,
+                    *max_slices,
+                    self.engine.capacity(),
+                )?;
+                return Ok(Prompt {
+                    tokens: prepared.tokens,
+                    sources,
+                    images: prepared.images,
+                    positions: Some(prepared.positions),
+                });
+            }
+        };
         let marker = tokenizer.encode("<|image_pad|>", true)?;
         ensure!(marker.len() == 1, "image marker must be one special token");
         ensure!(
@@ -118,5 +141,14 @@ mod tests {
         assert!(image_sources(&json!({"messages":[{"content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]})).is_err());
         assert!(image_sources(&json!({"messages":[{"content":"ordinary text"}]}))?.is_empty());
         Ok(())
+    }
+    #[test]
+    fn image_limits_fit_reserved_patch_rows() {
+        for batch in [128, 256, 512, 1024, 2048, 4096] {
+            let (minimum, maximum) = workspace_limits(true, batch);
+            assert!(minimum > 0 && minimum <= maximum);
+            assert!(maximum <= 1024 && maximum * 4 <= batch * 4);
+            assert_eq!(workspace_limits(false, batch), (256, 1024));
+        }
     }
 }

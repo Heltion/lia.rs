@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 
 impl Engine {
     pub fn synchronize(&self) -> Result<()> {
@@ -14,9 +15,18 @@ impl Engine {
         let mut available = 64 * 1024 * 1024;
         for (&elements, buffers) in pool.iter_mut().rev() {
             let decode = (1..=8).any(|batch| {
-                [1024, 4096, 5120, 6144, 10240, 12288, 17408, 248320]
-                    .iter()
-                    .any(|&width| elements == batch * width)
+                [
+                    1024,
+                    4096,
+                    5120,
+                    6144,
+                    10240,
+                    12288,
+                    17408,
+                    self.vocabulary_size(),
+                ]
+                .iter()
+                .any(|&width| elements == batch * width)
             });
             let count = if elements <= 32768 || decode {
                 buffers.len().min(available / (elements * 4).max(1))
@@ -51,6 +61,9 @@ impl Engine {
     pub fn max_draft(&self) -> usize {
         self.max_draft
     }
+    pub fn mtp_enabled(&self) -> bool {
+        self.geometry.mtp
+    }
     pub fn matrix_layout(&self) -> (usize, usize) {
         (self.split_k, self.row_group)
     }
@@ -62,7 +75,25 @@ impl Engine {
         }
     }
     pub fn integer_enabled(&self) -> bool {
-        self.integer
+        self.integer && !self.geometry.moe
+    }
+    pub fn prefill_precision(&self) -> &'static str {
+        if self.geometry.moe {
+            if self
+                .experts
+                .values()
+                .next()
+                .is_some_and(|e| e.bit_width() == 4)
+            {
+                "int4_bf16_dense_f16_f32_accumulation"
+            } else {
+                "gsq_w2_w8_mixed_f16_f32_accumulation"
+            }
+        } else if self.fp8_prefill() {
+            "mixed_e4m3_f16_f32_accumulation"
+        } else {
+            "f16"
+        }
     }
     pub fn current_token(&self) -> Result<u32> {
         let hidden = self
@@ -71,6 +102,16 @@ impl Engine {
             .ok_or_else(|| anyhow!("no target hidden state"))?;
         let logits = self.mm("output.weight", hidden)?;
         Ok(self.greedy(&logits)?[0])
+    }
+    /// Read raw next-token scores without advancing or modifying cached state.
+    pub fn current_logits(&self) -> Result<Vec<f32>> {
+        let hidden = self
+            .last_hidden
+            .as_ref()
+            .ok_or_else(|| anyhow!("no target hidden state"))?;
+        self.mm("output.weight", hidden)?
+            .to_host_vec(&self.stream)
+            .context("reading current target logits from GPU")
     }
     pub(super) fn copy(&self, input: &DeviceBuffer<f32>) -> Result<DeviceBuffer<f32>> {
         let mut out = DeviceBuffer::zeroed(&self.stream, input.len())?;
@@ -146,6 +187,7 @@ impl Engine {
         Ok(())
     }
     pub fn reset(&mut self) -> Result<()> {
+        self.decode_replay.borrow_mut().take();
         self.stream.synchronize()?;
         for state in &mut self.states {
             match state {

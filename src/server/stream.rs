@@ -52,7 +52,12 @@ impl Output {
                 )
             })
         });
-        (output, axum::response::Sse::new(events).into_response())
+        // Prefill and buffered tool arguments can outlast HTTP body-idle limits.
+        // SSE comments keep the transport live without adding model output.
+        let response = axum::response::Sse::new(events)
+            .keep_alive(axum::response::sse::KeepAlive::new())
+            .into_response();
+        (output, response)
     }
 
     fn send(&self, value: Json) {
@@ -139,9 +144,22 @@ impl Text {
                     self.pending.drain(..leading);
                     continue;
                 }
+                if !self.content {
+                    if text.starts_with("<think>") {
+                        self.pending.drain(.."<think>".len());
+                        continue;
+                    }
+                    if !last && "<think>".starts_with(text) {
+                        return Ok(());
+                    }
+                }
                 self.started = !text.is_empty();
             }
-            let marker = if self.content {
+            let implicit = !self.content
+                && text
+                    .find("<tool_call>")
+                    .is_some_and(|call| text.find("</think>").is_none_or(|end| call < end));
+            let marker = if self.content || implicit {
                 "<tool_call>"
             } else {
                 "</think>"
@@ -158,7 +176,7 @@ impl Text {
                     );
                 }
                 self.pending.drain(..position + marker.len());
-                if self.content {
+                if self.content || implicit {
                     self.tools = true;
                     self.pending.clear();
                     return Ok(());
@@ -171,9 +189,18 @@ impl Text {
             let held = if last {
                 0
             } else {
-                (1..marker.len())
+                (1.."<tool_call>".len())
                     .rev()
-                    .find(|&n| text.ends_with(&marker[..n]))
+                    .find(|&n| {
+                        let markers = if self.content {
+                            &["<tool_call>"][..]
+                        } else {
+                            &["</think>", "<tool_call>"][..]
+                        };
+                        markers
+                            .iter()
+                            .any(|marker| n < marker.len() && text.ends_with(&marker[..n]))
+                    })
                     .unwrap_or(0)
             };
             let length = text[..valid - held].trim_end().len();
@@ -199,6 +226,27 @@ impl Text {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_stream_preserves_transport_without_semantic_events() -> Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let (output, response) = Output::new(&json!({"model":"test"}));
+                let finish = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(16)).await;
+                    output.finish(&Ok(json!({"choices":[{"finish_reason":"stop"}]})));
+                });
+                let body = axum::body::to_bytes(response.into_body(), 65536).await?;
+                finish.await?;
+                let wire = std::str::from_utf8(&body)?;
+                assert!(wire.contains(":\n\n"), "expected a keepalive comment");
+                assert_eq!(wire.lines().filter(|s| s.starts_with("data:")).count(), 2);
+                assert!(wire.contains("[DONE]"));
+                Ok(())
+            })
+    }
 
     #[test]
     fn delimiters_and_unicode_across_every_byte() -> Result<()> {
@@ -227,8 +275,17 @@ mod tests {
 
     #[test]
     fn streamed_channel_whitespace_matches_nonstreamed_content() -> Result<()> {
-        for width in [1, 2, 3, 7, 128] {
-            let raw = " \n思考 中\t \n</think>\n\n  B words\n keep indent\t \n";
+        for (raw, width) in [
+            " \n思考 中\t \n</think>\n\n  B words\n keep indent\t \n",
+            " \n思考 尚未结束\t \n",
+            " \n<think>\n<think>思考 尚未结束\t \n",
+            "<think>思考</think>\nanswer",
+            "```json\n{\"value\":\"42\"}\n```",
+            "先查询<tool_call><function=f></function></tool_call>",
+        ]
+        .into_iter()
+        .flat_map(|raw| [1, 2, 3, 7, 128].into_iter().map(move |width| (raw, width)))
+        {
             let mut stream = Text::default();
             let mut reasoning = String::new();
             let mut content = String::new();
