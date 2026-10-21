@@ -1,6 +1,7 @@
 //! Seeded top-k/nucleus sampling and causal sample-and-match verification.
 use anyhow::{Result, anyhow, ensure};
 
+mod gumbel;
 mod random;
 mod speculative;
 
@@ -14,6 +15,8 @@ pub struct Sampling {
     top_p: f64,
     random: random::Random,
     verification_random: random::Random,
+    seed: u64,
+    position: Option<u64>,
 }
 
 impl Sampling {
@@ -35,8 +38,35 @@ impl Sampling {
             top_k,
             top_p,
             random: random::Random::new(seed as u32),
-            verification_random: random::Random::new(seed as u32),
+            // Keep acceptance/residual draws separate from target draws:
+            // identical seeds would reuse words already revealed by bonuses.
+            verification_random: random::Random::new(seed as u32 ^ 0x9e3779b9),
+            seed,
+            position: None,
         })
+    }
+
+    pub fn with_position_gumbel(mut self) -> Self {
+        self.position = Some(0);
+        self
+    }
+
+    pub fn position_keyed(&self) -> bool {
+        self.position.is_some()
+    }
+
+    pub fn rng_name(&self) -> &'static str {
+        if self.position_keyed() {
+            "murmur3_gumbel_fp32"
+        } else {
+            "mt19937"
+        }
+    }
+
+    pub fn set_position(&mut self, position: u64) {
+        if let Some(current) = &mut self.position {
+            *current = position;
+        }
     }
 
     pub fn distribution(
@@ -94,6 +124,10 @@ impl Sampling {
     }
 
     pub fn draw(&mut self, distribution: &Distribution) -> u32 {
+        if let Some(position) = self.position {
+            self.position = Some(position.wrapping_add(1));
+            return gumbel::draw(&distribution.entries, self.seed, position);
+        }
         if distribution.entries.len() == 1 {
             return distribution.entries[0].0;
         }

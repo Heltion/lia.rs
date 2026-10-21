@@ -369,4 +369,119 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    #[ignore = "requires LIA_TEST_GDN_REFERENCE with external real-input float64 reference"]
+    fn real_input_recurrence_and_partition() -> Result<()> {
+        use anyhow::{Context, ensure};
+        use std::path::{Path, PathBuf};
+        fn floats(path: &Path) -> Result<Vec<f32>> {
+            let bytes =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            ensure!(
+                bytes.len().is_multiple_of(4),
+                "invalid f32 reference length"
+            );
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+                .collect())
+        }
+        fn doubles(path: &Path) -> Result<Vec<f64>> {
+            let bytes =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            ensure!(
+                bytes.len().is_multiple_of(8),
+                "invalid f64 reference length"
+            );
+            Ok(bytes
+                .chunks_exact(8)
+                .map(|v| f64::from_le_bytes(v.try_into().unwrap()))
+                .collect())
+        }
+        fn compare(actual: &[f32], expected: &[f64], name: &str) -> Result<()> {
+            ensure!(actual.len() == expected.len(), "reference shape mismatch");
+            let mut error = 0.0f64;
+            let mut norm = 0.0f64;
+            let mut maximum = 0.0f64;
+            for (&a, &b) in actual.iter().zip(expected) {
+                let delta = f64::from(a) - b;
+                error += delta * delta;
+                norm += b * b;
+                maximum = maximum.max(delta.abs());
+            }
+            eprintln!(
+                "real GDN {name} relative_l2={} max_abs={maximum}",
+                (error / norm).sqrt()
+            );
+            close(actual, expected, name)
+        }
+        let directory = PathBuf::from(
+            std::env::var("LIA_TEST_GDN_REFERENCE").context("set LIA_TEST_GDN_REFERENCE")?,
+        );
+        let qk = floats(&directory.join("qk.bin"))?;
+        let conv = floats(&directory.join("conv.bin"))?;
+        let decay = floats(&directory.join("decay.bin"))?;
+        let beta = floats(&directory.join("beta.bin"))?;
+        let expected_output = doubles(&directory.join("output.bin"))?;
+        let expected_state = doubles(&directory.join("state.bin"))?;
+        let batch = decay.len();
+        ensure!(
+            batch > 17
+                && qk.len() == batch * 256
+                && conv.len() == batch * 384
+                && beta.len() == batch,
+            "invalid single-head reference shape"
+        );
+        let context = CudaContext::new(0)?;
+        let stream = context.default_stream();
+        let module = kernels::load(&context)?;
+        for split in [batch, batch / 2 + 1] {
+            let state = DeviceBuffer::<f32>::zeroed(&stream, 128 * 128)?;
+            let prepared = DeviceBuffer::<u32>::zeroed(&stream, 1)?;
+            let mut outputs = Vec::new();
+            let mut offset = 0;
+            while offset < batch {
+                let end = (offset + split).min(batch);
+                let q = DeviceBuffer::from_host(&stream, &qk[offset * 256..end * 256])?;
+                let v = DeviceBuffer::from_host(&stream, &conv[offset * 384..end * 384])?;
+                let a = DeviceBuffer::from_host(&stream, &decay[offset..end])?;
+                let b = DeviceBuffer::from_host(&stream, &beta[offset..end])?;
+                let output = DeviceBuffer::<f32>::zeroed(&stream, (end - offset) * 128)?;
+                // SAFETY: complete single-head rows, four value-shard CTAs,
+                // disjoint output and persistent state, with unused preparation.
+                unsafe {
+                    module.delta_chunk.delta_chunk::<false>(
+                        &stream,
+                        LaunchConfig {
+                            grid_dim: (4, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        1,
+                        1,
+                        &q,
+                        &v,
+                        &a,
+                        &b,
+                        &prepared,
+                        state.cu_deviceptr() as *mut f32,
+                        output.cu_deviceptr() as *mut f32,
+                    )?;
+                }
+                outputs.extend(output.to_host_vec(&stream)?);
+                offset = end;
+            }
+            compare(
+                &outputs,
+                &expected_output,
+                &format!("outputs split={split}"),
+            )?;
+            compare(
+                &state.to_host_vec(&stream)?,
+                &expected_state,
+                &format!("state split={split}"),
+            )?;
+        }
+        Ok(())
+    }
 }

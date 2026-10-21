@@ -3,22 +3,42 @@ use super::*;
 use crate::vision::{ImageGrid, PreparedImage};
 mod inputs;
 mod load;
+mod minicpm;
+mod minicpm_precision;
+pub(in crate::inference) mod offload;
 mod operations;
 
 pub(super) struct ImageEmbedding {
     start: usize,
-    data: Buffer,
+    data: DeviceBuffer<f32>,
 }
 
 impl Engine {
+    pub(super) fn past_image_embeddings(&self, position: usize) -> bool {
+        self.images
+            .iter()
+            .all(|image| position >= image.start + image.data.len() / self.geometry.hidden)
+    }
+
     /// Diagnostic host export; the multimodal forward path can retain the GPU buffer.
-    pub fn image_embeddings(&self, image: &PreparedImage) -> Result<Vec<f32>> {
+    pub fn image_embeddings(&mut self, image: &PreparedImage) -> Result<Vec<f32>> {
         self.encode_image_buffer(image)?
             .to_host_vec(&self.stream)
             .map_err(Into::into)
     }
 
-    fn encode_image_buffer(&self, image: &PreparedImage) -> Result<Buffer> {
+    fn encode_image_buffer(&mut self, image: &PreparedImage) -> Result<Buffer> {
+        if self.host_vision.is_empty() {
+            self.encode_image_resident(image)
+        } else {
+            self.encode_swapped(image)
+        }
+    }
+
+    fn encode_image_resident(&self, image: &PreparedImage) -> Result<Buffer> {
+        if self.vision_encoder == crate::models::VisionEncoder::MiniCpmV47 {
+            return self.encode_minicpm_image(image);
+        }
         let grid = ImageGrid::new(image.width, image.height)?;
         let patches = grid.token_count() * 4;
         anyhow::ensure!(self.vision_eps.is_some(), "no vision projector loaded");
@@ -97,17 +117,7 @@ impl Engine {
                 )?;
             }
             drop(qkv);
-            let attention = self.zeros(patches * 1152)?;
-            // SAFETY: full warps cover exactly 16 noncausal width-72 heads per patch.
-            unsafe {
-                self.module.vision_attention.attention(
-                    &self.stream,
-                    LaunchConfig::for_num_elems((patches * 16 * 32) as u32),
-                    patches,
-                    &rotated,
-                    attention.cu_deviceptr() as *mut f32,
-                )?;
-            }
+            let attention = self.vision_attention(&rotated, patches, false)?;
             drop(rotated);
             let projected = self.vision_mm(&format!("{p}.attn_out.weight"), &attention, patches)?;
             drop(attention);

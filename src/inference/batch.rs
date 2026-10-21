@@ -1,26 +1,57 @@
 use super::*;
 
 impl Engine {
+    pub(super) fn embed(&self, token: u32) -> Result<Buffer> {
+        self.embed_at(token, self.position)
+    }
+    pub(super) fn embed_at(&self, token: u32, position: usize) -> Result<Buffer> {
+        let emb = self.weight("token_embd.weight")?;
+        if emb.shape != [self.geometry.hidden, self.vocabulary_size()]
+            || token as usize >= emb.shape[1]
+        {
+            return Err(anyhow!("invalid vocabulary or token"));
+        }
+        let mut hidden = self.zeros(self.geometry.hidden)?;
+        // SAFETY: validated vocabulary index and embedding row extent.
+        unsafe {
+            self.module.basic.embedding(
+                &self.stream,
+                LaunchConfig::for_num_elems(self.geometry.hidden as u32),
+                emb.kind,
+                emb.bytes,
+                emb.block,
+                self.geometry.hidden,
+                token as usize,
+                &emb.data,
+                &mut hidden,
+            )?;
+        }
+        self.apply_image_embeddings(&hidden, position)?;
+        Ok(hidden)
+    }
+
     pub(super) fn embed_many(&self, tokens: &[u32]) -> Result<Buffer> {
         if tokens.is_empty()
             || tokens.len() > crate::gpu::MAX_PREFILL_BATCH
-            || tokens.iter().any(|t| *t >= 248320)
+            || tokens
+                .iter()
+                .any(|t| (*t as usize) >= self.vocabulary_size())
         {
             return Err(anyhow!("invalid token batch"));
         }
         let w = self.weight("token_embd.weight")?;
 
-        let mut out = self.zeros(tokens.len() * 5120)?;
+        let mut out = self.zeros(tokens.len() * self.geometry.hidden)?;
         // SAFETY: validated token indices, row-aligned embedding table and
         // exactly one guarded output per token embedding element.
         unsafe {
             self.module.basic.embedding_many(
                 &self.stream,
-                LaunchConfig::for_num_elems((tokens.len() * 5120) as u32),
+                LaunchConfig::for_num_elems((tokens.len() * self.geometry.hidden) as u32),
                 w.kind,
                 w.bytes,
                 w.block,
-                5120,
+                self.geometry.hidden,
                 &self.token_ids,
                 &w.data,
                 &mut out,
@@ -30,6 +61,9 @@ impl Engine {
         Ok(out)
     }
     pub(super) fn mtp_many(&self, tokens: &[u32], target: &DeviceBuffer<f32>) -> Result<()> {
+        if !self.geometry.mtp {
+            return Ok(());
+        }
         let batch = tokens.len();
         let embedding = self.embed_many(tokens)?;
         let prev: &DeviceBuffer<f32> = self.last_hidden.as_deref().unwrap_or(&self.zero_hidden);

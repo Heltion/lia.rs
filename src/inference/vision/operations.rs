@@ -39,8 +39,9 @@ impl Engine {
     }
 
     pub(super) fn vision_norm(&self, prefix: &str, input: &DeviceBuffer<f32>) -> Result<Buffer> {
+        let dimension = self.floats(&format!("vision.{prefix}.weight"))?.len();
         anyhow::ensure!(
-            input.len().is_multiple_of(1152),
+            dimension > 0 && input.len().is_multiple_of(dimension),
             "invalid vision normalization input"
         );
         let eps = self
@@ -51,9 +52,9 @@ impl Engine {
         unsafe {
             self.module.vision_math.layer_norm(
                 &self.stream,
-                LaunchConfig::for_num_elems((input.len() / 1152 * 32) as u32),
-                1152,
-                input.len() / 1152,
+                LaunchConfig::for_num_elems((input.len() / dimension * 32) as u32),
+                dimension,
+                input.len() / dimension,
                 eps,
                 input,
                 self.floats(&format!("vision.{prefix}.weight"))?,
@@ -62,6 +63,52 @@ impl Engine {
             )?;
         }
         Ok(output)
+    }
+
+    pub(super) fn vision_attention(
+        &self,
+        qkv: &DeviceBuffer<f32>,
+        patches: usize,
+        window: bool,
+    ) -> Result<Buffer> {
+        anyhow::ensure!(
+            patches > 0 && qkv.len() == patches * 3456 && (!window || patches.is_multiple_of(4)),
+            "invalid vision QKV or window extent"
+        );
+        let attention = self.zeros(patches * 1152)?;
+        // SAFETY: complete16-head width72 QKV rows and the checked4-row windows.
+        unsafe {
+            if window {
+                self.module.vision_attention.attention::<4>(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((patches * 16 * 32) as u32),
+                    patches,
+                    qkv,
+                    attention.cu_deviceptr() as *mut f32,
+                )?;
+            } else if patches <= 16 {
+                self.module.vision_attention.attention::<0>(
+                    &self.stream,
+                    LaunchConfig::for_num_elems((patches * 16 * 32) as u32),
+                    patches,
+                    qkv,
+                    attention.cu_deviceptr() as *mut f32,
+                )?;
+            } else {
+                self.module.vision_flash.tiled_attention::<32, false>(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: ((patches.div_ceil(32) * 16) as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    patches,
+                    qkv,
+                    attention.cu_deviceptr() as *mut f32,
+                )?;
+            }
+        }
+        Ok(attention)
     }
 
     pub(super) fn vision_affine(&self, values: Buffer, name: &str, gelu: bool) -> Result<Buffer> {

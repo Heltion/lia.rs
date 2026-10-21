@@ -17,8 +17,16 @@ use std::{
 mod allocation;
 mod attention_plan;
 mod buffer;
+mod geometry;
 mod graph;
+mod gsq;
+mod host_weights;
+mod huggingface;
+mod initialize;
+mod moe;
+mod penalty;
 use buffer::Buffer;
+use geometry::Geometry;
 struct RotaryWork {
     data: DeviceBuffer<f32>,
     key: Option<(usize, usize)>,
@@ -39,6 +47,7 @@ struct SelectionWork {
     candidates: DeviceBuffer<u64>,
 }
 struct Weight {
+    group: Option<GroupScale>,
     data: DeviceBuffer<u8>,
     floats: Option<DeviceBuffer<f32>>,
     shape: Vec<usize>,
@@ -46,6 +55,18 @@ struct Weight {
     fp8_scale: Option<f32>,
     block: usize,
     bytes: usize,
+}
+struct GroupScale {
+    bits: u32,
+    size: usize,
+    scales: DeviceBuffer<f32>,
+}
+struct RoutingWork {
+    router_count: DeviceBuffer<u32>,
+    register: Option<crate::gpu::moe::RegisterWork>,
+    grouped: crate::gpu::moe::Grouped,
+    selected: DeviceBuffer<u32>,
+    probabilities: DeviceBuffer<f32>,
 }
 enum State {
     Recurrent {
@@ -65,10 +86,16 @@ pub struct Snapshot {
     images: Vec<Rc<vision::ImageEmbedding>>,
 }
 pub struct Engine {
+    geometry: Geometry,
+    experts: BTreeMap<usize, crate::gpu::moe::Experts>,
+    routing: Option<RoutingWork>,
+    presence: Option<DeviceBuffer<f32>>,
+    presence_strength: f32,
     _context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     module: kernels::LoadedModule,
     weights: BTreeMap<String, Weight>,
+    host_weight_bytes: usize,
     states: Vec<State>,
     position: usize,
     capacity: usize,
@@ -80,6 +107,7 @@ pub struct Engine {
     profile: bool,
     preallocated: bool,
     cuda_graph: bool,
+    decode_replay: RefCell<Option<graph::replay::Replay>>,
     graphs: RefCell<BTreeMap<(u8, usize, bool, bool), graph::Executable>>,
     graph_stats: RefCell<[u64; 3]>,
     scratch_reserved: usize,
@@ -91,8 +119,11 @@ pub struct Engine {
     split_k: usize,
     row_group: usize,
     matrix_threads: usize,
+    parallel_convolution: bool,
     attention_mma_decode: bool,
-    attention_query_tiles: bool,
+    attention_merge_shared: bool,
+    attention_decode_span: usize,
+    attention_query_tiles: usize,
     attention_work: RefCell<Option<DeviceBuffer<f32>>>,
     prefill_tile: usize,
     prefill_batch: usize,
@@ -107,6 +138,9 @@ pub struct Engine {
     verify_hidden: Option<Buffer>,
     rotary: RefCell<RotaryWork>,
     vision_eps: Option<f32>,
+    vision_encoder: crate::models::VisionEncoder,
+    host_vision: BTreeMap<String, vision::offload::HostWeight>,
+    kv_offloaded: bool,
     images: Vec<Rc<vision::ImageEmbedding>>,
 }
 fn config_u64(model: &Model, key: &str) -> Result<u64> {

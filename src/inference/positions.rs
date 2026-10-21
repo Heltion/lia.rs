@@ -20,6 +20,7 @@ impl Engine {
     }
 
     pub(super) fn upload_position_plan(&self, plan: Option<PositionPlan>) -> Result<()> {
+        self.decode_replay.borrow_mut().take();
         let mut rotary = self.rotary.borrow_mut();
         if let Some(plan) = &plan {
             anyhow::ensure!(

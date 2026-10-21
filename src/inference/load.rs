@@ -3,6 +3,9 @@ use anyhow::Context;
 
 impl Engine {
     pub fn load(path: &str, capacity: usize) -> Result<Self> {
+        if std::path::Path::new(path).is_dir() {
+            return Self::load_huggingface(path, capacity, false);
+        }
         let model = Model::open(path).context("reading model metadata")?;
         Self::load_from_model(path, capacity, &model)
     }
@@ -19,13 +22,14 @@ impl Engine {
         model: &Model,
         projector: Option<&str>,
     ) -> Result<Self> {
-        if capacity == 0 || capacity > 32768 {
-            return Err(anyhow!("context capacity must be 1..=32768"));
-        }
         if !matches!(model.metadata.get("general.architecture"), Some(Value::String(s)) if s == "qwen35")
         {
             return Err(anyhow!("only qwen35 is implemented"));
         }
+        validate_capacity(
+            capacity,
+            usize::try_from(config_u64(model, "qwen35.context_length")?)?,
+        )?;
         for (key, expected) in [
             ("block_count", 65),
             ("nextn_predict_layers", 1),
@@ -79,6 +83,8 @@ impl Engine {
             fp8_prefill || std::env::var("LIA_PREFILL_WEIGHT_PREPACK").as_deref() != Ok("1"),
             "FP8 weight prepacking requires LIA_PREFILL_FP8=1"
         );
+        let placement = host_weights::Placement::from_env()?;
+        let mut host_weight_bytes = 0;
         for tensor in &model.tensors {
             let mut host = vec![0; tensor.byte_len as usize];
             file.seek(SeekFrom::Start(model.data_offset + tensor.offset))?;
@@ -86,6 +92,7 @@ impl Engine {
                 .with_context(|| format!("reading tensor {}", tensor.name))?;
             let (block, bytes) = crate::gguf::layout(tensor.kind)
                 .ok_or_else(|| anyhow!("unsupported storage layout"))?;
+            let on_host = placement.contains(&tensor.name);
             let floats = if tensor.kind == 0 {
                 let values: Vec<f32> = host
                     .as_chunks::<4>()
@@ -93,14 +100,24 @@ impl Engine {
                     .iter()
                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                     .collect();
-                Some(DeviceBuffer::from_host(&stream, &values)?)
+                Some(if on_host {
+                    host_weights::allocate(&context, &values)?
+                } else {
+                    DeviceBuffer::from_host(&stream, &values)?
+                })
             } else {
                 None
             };
-            let data = DeviceBuffer::from_host(&stream, &host)?;
+            let data = if on_host {
+                host_weight_bytes += host.len() + floats.as_ref().map_or(0, |v| v.num_bytes());
+                host_weights::allocate(&context, &host)?
+            } else {
+                DeviceBuffer::from_host(&stream, &host)?
+            };
             weights.insert(
                 tensor.name.clone(),
                 Weight {
+                    group: None,
                     data,
                     floats,
                     shape: tensor.shape.iter().map(|x| *x as usize).collect(),
@@ -123,136 +140,57 @@ impl Engine {
                 },
             );
         }
-        let mut states = Vec::new();
-        for layer in 0..65 {
-            states.push(if layer == 64 || (layer + 1) % 4 == 0 {
-                State::Attention {
-                    k: DeviceBuffer::zeroed(&stream, capacity * 1024)?,
-                    v: DeviceBuffer::zeroed(&stream, capacity * 1024)?,
-                }
-            } else {
-                State::Recurrent {
-                    conv: DeviceBuffer::zeroed(&stream, 3 * 10240)?,
-                    matrix: DeviceBuffer::zeroed(&stream, 48 * 128 * 128)?,
-                }
-            });
-        }
-        stream.synchronize()?;
-        let rotary = RefCell::new(RotaryWork {
-            data: DeviceBuffer::zeroed(&stream, crate::gpu::MAX_PREFILL_BATCH * 64)?,
-            key: None,
-            positions: DeviceBuffer::zeroed(&stream, capacity * 4)?,
-            plan: None,
-        });
-        let token_ids = DeviceBuffer::zeroed(&stream, crate::gpu::MAX_PREFILL_BATCH)?;
-        let zero_hidden = DeviceBuffer::zeroed(&stream, 5120)?;
-        let mut engine = Self {
-            _context: context,
+        let mut engine = Self::initialize(
+            context,
             stream,
             module,
             weights,
-            states,
-            position: 0,
             capacity,
+            Geometry::dense(),
             eps,
             rope_base,
-            pool: Rc::new(RefCell::new(BTreeMap::new())),
-            last_hidden: None,
-            mtp_prepared: None,
-            profile: std::env::var_os("LIA_PROFILE").is_some(),
-            integer: std::env::var("LIA_INT8").as_deref().unwrap_or("1") != "0",
-            split_k: std::env::var("LIA_SPLIT_K")
-                .unwrap_or_else(|_| "1".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n == 1 || *n == 4)
-                .ok_or_else(|| anyhow!("LIA_SPLIT_K must be 1 or 4"))?,
-            row_group: std::env::var("LIA_MM_ROWS")
-                .unwrap_or_else(|_| "2".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n == 1 || *n == 2)
-                .ok_or_else(|| anyhow!("LIA_MM_ROWS must be 1 or 2"))?,
-            matrix_threads: std::env::var("LIA_MM_THREADS")
-                .unwrap_or_else(|_| "128".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|n| [64, 128].contains(n))
-                .ok_or_else(|| anyhow!("LIA_MM_THREADS must be 64, 128 or 256"))?,
-            attention_mma_decode: std::env::var("LIA_ATTN_MMA_DECODE").as_deref() == Ok("1"),
-            attention_query_tiles: std::env::var("LIA_ATTN_QUERY_TILES").as_deref() == Ok("1"),
-            attention_work: RefCell::new(None),
-            prefill_batch: std::env::var("LIA_PREFILL_BATCH")
-                .unwrap_or_else(|_| "512".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|batch| [512, 1024, 2048, 4096].contains(batch))
-                .ok_or_else(|| anyhow!("LIA_PREFILL_BATCH must be 512, 1024, 2048, or 4096"))?,
-            prefill_tile: std::env::var("LIA_PREFILL_TILE")
-                .unwrap_or_else(|_| "128".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|tile| [64, 128].contains(tile))
-                .ok_or_else(|| anyhow!("LIA_PREFILL_TILE must be 64 or 128"))?,
-            fp8_work: RefCell::new(None),
-            prefill_input: RefCell::new(None),
-            preallocated: cuda_graph || std::env::var("LIA_PREALLOCATE").as_deref() == Ok("1"),
+            fp8_prefill,
             cuda_graph,
-            graphs: RefCell::new(BTreeMap::new()),
-            graph_stats: RefCell::new([0; 3]),
-            scratch_reserved: 0,
-            token_ids,
-            zero_hidden,
-            gdn_prepared: None,
-            greedy_work: BTreeMap::new(),
-            quant_work: RefCell::new(BTreeMap::new()),
-            sampling_work: RefCell::new(BTreeMap::new()),
-            spec_states: Vec::new(),
-            capture: false,
-            max_draft: std::env::var("LIA_MTP_DRAFT_MAX")
-                .unwrap_or_else(|_| "3".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|n| (1..=7).contains(n))
-                .ok_or_else(|| anyhow!("LIA_MTP_DRAFT_MAX must be between 1 and 7"))?,
-            stochastic_mtp: match std::env::var("LIA_MTP_SAMPLING")
-                .as_deref()
-                .unwrap_or("match")
-            {
-                "match" => false,
-                "stochastic" => true,
-                _ => return Err(anyhow!("LIA_MTP_SAMPLING must be match or stochastic")),
-            },
-            verify_hidden: None,
-            rotary,
-            vision_eps: None,
-            images: Vec::new(),
-        };
-        engine.prepare_speculation_buffers()?;
-        engine.prepare_small_workspaces()?;
-        if std::env::var("LIA_GDN_PARALLEL").as_deref() == Ok("1") {
-            engine.gdn_prepared = Some(DeviceBuffer::zeroed(
-                &engine.stream,
-                48 * crate::gpu::MAX_PREFILL_BATCH.div_ceil(16) * 1072,
-            )?);
-        }
-        if fp8_prefill {
-            let elements = 17408 * engine.prefill_batch.min(crate::gpu::MAX_PREFILL_BATCH);
-            *engine.fp8_work.borrow_mut() = Some(Fp8Work {
-                weight_tiles: if std::env::var("LIA_PREFILL_WEIGHT_PREPACK").as_deref() == Ok("1") {
-                    Some(DeviceBuffer::zeroed(&engine.stream, 17408 * 5120 / 4)?)
-                } else {
-                    None
-                },
-                packed: DeviceBuffer::zeroed(&engine.stream, elements.div_ceil(4))?,
-                maxima: DeviceBuffer::zeroed(&engine.stream, elements.div_ceil(1024))?,
-                scales: DeviceBuffer::zeroed(&engine.stream, 2)?,
-            });
-        }
+        )?;
+        engine.host_weight_bytes = host_weight_bytes;
         if let Some(path) = projector {
-            engine.load_vision(path)?;
+            if vision::offload::enabled() {
+                let cache = engine.park_attention()?;
+                engine.load_vision(path)?;
+                engine.host_vision =
+                    vision::offload::park_weights(&mut engine.weights, &engine.stream)?;
+                engine.restore_attention(cache)?;
+            } else {
+                engine.load_vision(path)?;
+            }
         }
         engine.prepare_buffers()?;
         Ok(engine)
+    }
+}
+
+fn validate_capacity(capacity: usize, model_limit: usize) -> Result<()> {
+    let limit = model_limit.min(crate::MAX_CONTEXT_TOKENS);
+    anyhow::ensure!(
+        capacity > 0 && capacity <= limit,
+        "context capacity must be 1..={limit}"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_capacity_respects_model_and_index_limits() -> Result<()> {
+        for capacity in [1, 32768, 49152, 65536, 131072, 262144] {
+            validate_capacity(capacity, 262144)?;
+        }
+        assert!(validate_capacity(0, 262144).is_err());
+        assert!(validate_capacity(65536, 32768).is_err());
+        assert!(validate_capacity(262145, usize::MAX).is_err());
+        assert!(validate_capacity(1, 0).is_err());
+        Ok(())
     }
 }

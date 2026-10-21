@@ -1,32 +1,6 @@
 use super::*;
 
 impl Engine {
-    pub(super) fn embed(&self, token: u32) -> Result<Buffer> {
-        self.embed_at(token, self.position)
-    }
-    fn embed_at(&self, token: u32, position: usize) -> Result<Buffer> {
-        let emb = self.weight("token_embd.weight")?;
-        if emb.shape != [5120, 248320] || token as usize >= emb.shape[1] {
-            return Err(anyhow!("invalid vocabulary or token"));
-        }
-        let mut hidden = self.zeros(5120)?;
-        // SAFETY: validated vocabulary index and embedding row extent.
-        unsafe {
-            self.module.basic.embedding(
-                &self.stream,
-                LaunchConfig::for_num_elems(5120),
-                emb.kind,
-                emb.bytes,
-                emb.block,
-                5120,
-                token as usize,
-                &emb.data,
-                &mut hidden,
-            )?;
-        }
-        self.apply_image_embeddings(&hidden, position)?;
-        Ok(hidden)
-    }
     pub(super) fn mtp_given(
         &self,
         token: u32,
@@ -106,16 +80,26 @@ impl Engine {
         Ok(result)
     }
     pub(super) fn greedy(&self, logits: &DeviceBuffer<f32>) -> Result<Vec<u32>> {
-        const VOCAB: usize = 248320;
-        if logits.is_empty() || !logits.len().is_multiple_of(VOCAB) {
+        self.greedy_prefix(logits, &[], false)
+    }
+    pub(super) fn greedy_prefix(
+        &self,
+        logits: &DeviceBuffer<f32>,
+        prefix: &[u32],
+        causal: bool,
+    ) -> Result<Vec<u32>> {
+        let adjusted = self.adjusted_logits_prefix(logits, prefix, causal)?;
+        let logits = adjusted.as_deref().unwrap_or(logits);
+        let vocabulary = self.vocabulary_size();
+        if logits.is_empty() || !logits.len().is_multiple_of(vocabulary) {
             return Err(anyhow!("invalid greedy logit shape"));
         }
-        let parts = VOCAB.div_ceil(1024);
-        let count = logits.len() / VOCAB * parts;
+        let parts = vocabulary.div_ceil(1024);
+        let count = logits.len() / vocabulary * parts;
         let values = self.zeros(count)?;
         let ids = self
             .greedy_work
-            .get(&(logits.len() / VOCAB))
+            .get(&(logits.len() / vocabulary))
             .ok_or_else(|| anyhow!("greedy batch exceeds reserved workspace"))?;
         // SAFETY: one complete warp per disjoint partition, matching partial
         // value and index arrays. Each input row covers the full vocabulary.
@@ -123,7 +107,7 @@ impl Engine {
             self.module.selection.argmax_partial(
                 &self.stream,
                 LaunchConfig::for_num_elems((count * 32) as u32),
-                VOCAB,
+                vocabulary,
                 parts,
                 logits,
                 values.cu_deviceptr() as *mut f32,

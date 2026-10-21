@@ -336,6 +336,8 @@ mod tests {
         check::<64>(513, 17, 4, 2)?;
         check::<128>(513, 33, 4, 2)?;
         check::<64>(2049, 1, 24, 4)?;
+        check::<64>(2049, 1, 16, 2)?;
+        check::<128>(513, 3, 16, 2)?;
         check::<64>(2049, 4, 24, 4)?;
         check::<128>(513, 17, 24, 4)?;
         check::<128>(1025, 129, 4, 2)?;
@@ -476,56 +478,84 @@ mod tests {
             "half-cache partitioned attention",
         )?;
         println!("GPU f16 KV cache and partitioned attention match the independent reference");
-        for span in [256, 512, 1024, tokens.div_ceil(32) * 32] {
+        for span in [32, 64, 128, 256, 512, 1024, tokens.div_ceil(32) * 32] {
             let mma_parts = tokens.div_ceil(span);
             for grouped in [false, true] {
                 let mut baseline = None;
                 for stride in [batch, 16] {
                     let mma_partial = DeviceBuffer::<f32>::zeroed(
                         &stream,
-                        batch.min(stride) * qh * mma_parts * 258,
+                        batch.min(stride).div_ceil(32) * 32 * qh * mma_parts * 258,
                     )?;
                     for query_start in (0..batch).step_by(stride) {
                         let query_count = (batch - query_start).min(stride);
                         let heads = if grouped { kvh } else { qh };
                         let queries = query_count * if grouped { qh / kvh } else { 1 };
-                        let config = LaunchConfig {
-                            grid_dim: ((queries.div_ceil(16) * heads * mma_parts) as u32, 1, 1),
-                            block_dim: (256, 1, 1),
-                            shared_mem_bytes: 0,
-                        };
-                        // SAFETY: independent complete causal queries, matching GQA grouping and disjoint output slots.
+                        let legacy = DeviceBuffer::<f32>::zeroed(&stream, mma_partial.len())?;
+                        macro_rules! launch_mma {
+                            ($grouped:literal, $reuse:literal, $rows:literal, $dest:expr) => {{
+                                let prepared = module
+                                    .flash_mma
+                                    .prepare_flash_mma::<$grouped, $reuse, $rows>(
+                                        cuda_core::simt::LaunchConfig1D::new(
+                                            (queries.div_ceil($rows) * heads * mma_parts) as u32,
+                                            $rows * 16,
+                                            if $rows == 32 { 60160 } else { 0 },
+                                        ),
+                                    )?;
+                                module.flash_mma.flash_mma::<$grouped, $reuse, $rows>(
+                                    &stream,
+                                    &prepared,
+                                    qh,
+                                    kvh,
+                                    tokens,
+                                    span,
+                                    mma_parts,
+                                    query_start,
+                                    query_count,
+                                    &dq,
+                                    &k16,
+                                    &v16,
+                                    $dest.cu_deviceptr() as *mut f32,
+                                )?;
+                            }};
+                        }
+                        // SAFETY: complete causal queries, valid GQA grouping, sized shared memory and disjoint outputs.
                         unsafe {
                             if grouped {
-                                module.flash_mma.flash_mma::<true>(
-                                    &stream,
-                                    config,
-                                    qh,
-                                    kvh,
-                                    tokens,
-                                    span,
-                                    mma_parts,
-                                    query_start,
-                                    &dq,
-                                    &k16,
-                                    &v16,
-                                    mma_partial.cu_deviceptr() as *mut f32,
-                                )?;
+                                launch_mma!(true, false, 16, legacy);
                             } else {
-                                module.flash_mma.flash_mma::<false>(
-                                    &stream,
-                                    config,
-                                    qh,
-                                    kvh,
-                                    tokens,
-                                    span,
-                                    mma_parts,
-                                    query_start,
-                                    &dq,
-                                    &k16,
-                                    &v16,
-                                    mma_partial.cu_deviceptr() as *mut f32,
-                                )?;
+                                launch_mma!(false, false, 16, legacy);
+                            }
+                            for rows in [16, 32] {
+                                let before = mma_partial.to_host_vec(&stream)?;
+                                match (grouped, rows) {
+                                    (true, 16) => launch_mma!(true, true, 16, mma_partial),
+                                    (true, 32) => launch_mma!(true, true, 32, mma_partial),
+                                    (false, 16) => launch_mma!(false, true, 16, mma_partial),
+                                    (false, 32) => launch_mma!(false, true, 32, mma_partial),
+                                    _ => unreachable!(),
+                                }
+                                let old = legacy.to_host_vec(&stream)?;
+                                let new = mma_partial.to_host_vec(&stream)?;
+                                let active = query_count * qh * mma_parts * 258;
+                                assert_eq!(
+                                    &new[active..],
+                                    &before[active..],
+                                    "query window tail modified: rows={rows},batch={batch},span={span},start={query_start}"
+                                );
+                                for (i, (old, new)) in old
+                                    .iter()
+                                    .zip(new.iter())
+                                    .enumerate()
+                                    .take(query_count * qh * mma_parts * 258)
+                                {
+                                    assert_eq!(
+                                        old.to_bits(),
+                                        new.to_bits(),
+                                        "Tensor attention: rows={rows},batch={batch},grouped={grouped},span={span},start={query_start},element={i}"
+                                    );
+                                }
                             }
                             module.attention.flash_merge::<256>(
                                 &stream,

@@ -28,6 +28,7 @@ impl Engine {
         let mut distributions = Vec::new();
         let mut token = first;
         let mut chain: Option<Buffer> = None;
+        let mut prefix = vec![first];
         for step in 0..maximum {
             if self.position + step >= self.capacity {
                 break;
@@ -43,17 +44,18 @@ impl Engine {
             let logits = logits.ok_or_else(|| anyhow!("missing draft logits"))?;
             token = if let Some(sampling) = sampling.as_deref_mut() {
                 let distribution = self
-                    .distributions(&logits, sampling)?
+                    .distributions_prefix(&logits, sampling, &prefix, false)?
                     .pop()
                     .ok_or_else(|| anyhow!("missing draft distribution"))?;
                 let token = sampling.draw(&distribution);
                 distributions.push(distribution);
                 token
             } else {
-                self.greedy(&logits)?[0]
+                self.greedy_prefix(&logits, &prefix, false)?[0]
             };
             chain = Some(hidden);
             proposals.push(token);
+            prefix.push(token);
             if token == eos {
                 break;
             }
@@ -107,6 +109,16 @@ impl Engine {
         if maximum == 0 {
             return Err(anyhow!("context capacity exceeded"));
         }
+        if !self.geometry.mtp {
+            self.step(first, false)?;
+            self.remember_generated(first)?;
+            let next = if let Some(sampling) = sampling {
+                self.current_sample(sampling)?
+            } else {
+                self.current_token()?
+            };
+            return Ok((vec![first], next, 0, 0));
+        }
         self.prepare_speculation_buffers()?;
         let start_position = self.position;
         let stochastic = draft_sampling.is_some();
@@ -124,10 +136,10 @@ impl Engine {
         let verified = verification?.ok_or_else(|| anyhow!("missing verification logits"))?;
         let (accepted, logits) = if stochastic {
             let sampling = sampling.ok_or_else(|| anyhow!("missing target sampler"))?;
-            let distributions = self.distributions(&verified, sampling)?;
+            let distributions = self.distributions_prefix(&verified, sampling, &inputs, true)?;
             sampling.select_speculative(&distributions, &drafts, &draft_distributions, eos)?
         } else {
-            self.select_verified(&verified, &drafts, eos, sampling)?
+            self.select_verified(&verified, &drafts, eos, sampling, &inputs)?
         };
         let count = 1 + accepted;
         if count < inputs.len() {
@@ -176,6 +188,9 @@ impl Engine {
             self.mtp_prepared = None;
         }
         inputs.truncate(count);
+        for &token in &inputs {
+            self.remember_generated(token)?;
+        }
         self.verify_hidden = None;
         Ok((inputs, logits, drafts.len(), accepted))
     }

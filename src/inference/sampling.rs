@@ -9,6 +9,7 @@ impl Engine {
             .ok_or_else(|| anyhow!("no target hidden state"))?;
         let logits = self.mm("output.weight", hidden)?;
         let distributions = self.distributions(&logits, sampling)?;
+        sampling.set_position(self.position.saturating_sub(1) as u64);
         Ok(sampling.draw(
             distributions
                 .first()
@@ -21,13 +22,25 @@ impl Engine {
         logits: &DeviceBuffer<f32>,
         sampling: &Sampling,
     ) -> Result<Vec<Distribution>> {
-        const VOCAB: usize = 248320;
+        self.distributions_prefix(logits, sampling, &[], false)
+    }
+
+    pub(super) fn distributions_prefix(
+        &self,
+        logits: &DeviceBuffer<f32>,
+        sampling: &Sampling,
+        prefix: &[u32],
+        causal: bool,
+    ) -> Result<Vec<Distribution>> {
+        let adjusted = self.adjusted_logits_prefix(logits, prefix, causal)?;
+        let logits = adjusted.as_deref().unwrap_or(logits);
+        let vocabulary = self.vocabulary_size();
         anyhow::ensure!(
-            !logits.is_empty() && logits.len().is_multiple_of(VOCAB),
+            !logits.is_empty() && logits.len().is_multiple_of(vocabulary),
             "invalid sampling logit shape"
         );
-        let batch = logits.len() / VOCAB;
-        let parts = VOCAB.div_ceil(1024);
+        let batch = logits.len() / vocabulary;
+        let parts = vocabulary.div_ceil(1024);
         let slots = parts * 20;
         let required = batch * slots;
         let mut workspace = self.sampling_work.borrow_mut();
@@ -49,7 +62,7 @@ impl Engine {
             self.module.topk.top20(
                 &self.stream,
                 LaunchConfig::for_num_elems((batch * parts * 32) as u32),
-                VOCAB,
+                vocabulary,
                 parts,
                 logits,
                 workspace.candidates.cu_deviceptr() as *mut u64,
@@ -75,12 +88,13 @@ impl Engine {
         drafts: &[u32],
         eos: u32,
         sampling: Option<&mut Sampling>,
+        prefix: &[u32],
     ) -> Result<(usize, u32)> {
         if let Some(sampling) = sampling {
-            let distributions = self.distributions(logits, sampling)?;
+            let distributions = self.distributions_prefix(logits, sampling, prefix, true)?;
             return sampling.select_prefix(&distributions, drafts, eos);
         }
-        let verified = self.greedy(logits)?;
+        let verified = self.greedy_prefix(logits, prefix, true)?;
         let mut accepted = 0;
         for (index, proposal) in drafts.iter().enumerate() {
             if verified[index] != *proposal {

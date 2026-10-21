@@ -10,6 +10,10 @@ impl Sampling {
         eos: u32,
     ) -> Result<(usize, u32)> {
         ensure!(
+            !self.position_keyed(),
+            "position-keyed Gumbel does not support stochastic draft rejection"
+        );
+        ensure!(
             targets.len() == proposals.len() + 1 && drafts.len() == proposals.len(),
             "invalid speculative distributions"
         );
@@ -62,6 +66,40 @@ impl Distribution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acceptance_is_independent_of_earlier_bonus_tokens() -> Result<()> {
+        let mut counts = [[0usize; 2]; 2];
+        for seed in 0..50_000 {
+            let mut sampler = Sampling::new(1.0, 2, 1.0, seed)?;
+            let point = || Distribution {
+                entries: vec![(0, 1.0)],
+            };
+            let balanced = || Distribution {
+                entries: vec![(0, 0.5), (1, 0.5)],
+            };
+            // First emit a fair bonus token without consuming acceptance RNG.
+            let (_, previous) =
+                sampler.select_speculative(&[point(), balanced()], &[0], &[point()], 99)?;
+            // Condition on acceptance of an intervening proposal. The next
+            // target must remain fair for either earlier bonus token.
+            let (accepted, _) =
+                sampler.select_speculative(&[balanced(), point()], &[0], &[point()], 99)?;
+            if accepted == 0 {
+                continue;
+            }
+            let (accepted, corrected) =
+                sampler.select_speculative(&[balanced(), point()], &[0], &[point()], 99)?;
+            let token = if accepted == 0 { corrected } else { 0 };
+            counts[previous as usize][token as usize] += 1;
+        }
+        for row in counts {
+            let total = row.iter().sum::<usize>();
+            assert!(total > 10_000);
+            assert!((row[0] as f64 / total as f64 - 0.5).abs() < 0.02);
+        }
+        Ok(())
+    }
 
     #[test]
     fn acceptance_and_residual_reproduce_target_mass() -> Result<()> {
