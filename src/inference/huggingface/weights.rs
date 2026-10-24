@@ -66,7 +66,8 @@ impl Loader<'_> {
         );
         let mut bytes = super::layout::rows(name, self.archive.read(name)?, shape[0]);
         super::layout::dense_columns(name, &mut bytes, shape)?;
-        let data = if name == "model.language_model.embed_tokens.weight"
+        let data = if (name == "model.language_model.embed_tokens.weight"
+            || name == "llm.model.embed_tokens.weight")
             && std::env::var("LIA_HOST_EMBEDDING").as_deref() == Ok("1")
         {
             crate::inference::host_weights::allocate(self.stream.context(), &bytes)?

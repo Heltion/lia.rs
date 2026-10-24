@@ -1,13 +1,33 @@
 use super::*;
 
 impl Session {
+    fn decode_output(&self, tokenizer: &Tokenizer, tokens: &[u32]) -> Result<Vec<u8>> {
+        if self.skip_special {
+            tokenizer.decode_text(tokens)
+        } else {
+            tokenizer.decode(tokens)
+        }
+    }
+
     pub(super) fn chat(
         &mut self,
         tokenizer: &Tokenizer,
         request: &Json,
         output: Option<&super::stream::Output>,
     ) -> Result<Json> {
-        let mut streaming = super::stream::Text::default();
+        let adapted = super::speech::prepare(request, self.speech.is_some())?;
+        let request = adapted.as_ref();
+        let mut speech = if super::speech::requested(request)? {
+            Some(
+                self.speech
+                    .as_mut()
+                    .context("speech output unavailable")?
+                    .begin(&mut self.engine, request)?,
+            )
+        } else {
+            None
+        };
+        let text_output = speech.as_ref().is_none_or(|s| s.text());
         if let Some(output) = output {
             output.delta(json!({"role":"assistant","content":""}));
         }
@@ -45,9 +65,18 @@ impl Session {
         } else {
             None
         };
-        let start = Instant::now();
+        let frontend = Instant::now();
         let prepared = self.prepare_prompt(tokenizer, request)?;
+        let frontend_ms = frontend.elapsed().as_secs_f64() * 1000.;
         let prompt = &prepared.tokens;
+        if let Some(capture) = &mut speech {
+            capture.start_prompt(prompt)?;
+        }
+        // A prefilled TTS boundary enters the answer channel even when thinking
+        // remains enabled in the model request. Preserve that actual prompt state.
+        let output_thinking = crate::chat::thinking_enabled(request)
+            && !(self.string_content && prompt.last() == Some(&151703));
+        let mut streaming = super::stream::Text::with_thinking(output_thinking);
         if prompt.is_empty() {
             return Err(anyhow!("empty rendered prompt"));
         }
@@ -65,8 +94,9 @@ impl Session {
             .eos_tokens
             .first()
             .ok_or_else(|| anyhow!("missing EOS token"))?;
+        let prefill = Instant::now();
         self.engine.trim_scratch();
-        if prepared.sources != self.image_sources {
+        if prepared.sources != self.media_sources {
             self.engine.reset()?;
             self.tokens.clear();
         }
@@ -84,9 +114,10 @@ impl Session {
                 self.tokens.clear();
             }
         }
-        if self.tokens.is_empty() && !prepared.images.is_empty() {
-            self.engine.prepare_image_inputs(
+        if self.tokens.is_empty() && (!prepared.images.is_empty() || !prepared.audios.is_empty()) {
+            self.engine.prepare_media_inputs(
                 &prepared.images,
+                &prepared.audios,
                 prepared
                     .positions
                     .clone()
@@ -95,7 +126,7 @@ impl Session {
         } else {
             self.engine.set_position_plan(prepared.positions)?;
         }
-        self.image_sources = prepared.sources;
+        self.media_sources = prepared.sources;
         let cached = self.tokens.len();
         let mut processed = cached;
         let mut batch_index = 0;
@@ -118,7 +149,7 @@ impl Session {
                     "prefill {}/{} elapsed_seconds={:.2}",
                     processed,
                     prompt.len(),
-                    start.elapsed().as_secs_f64()
+                    prefill.elapsed().as_secs_f64()
                 );
             }
             batch_index += 1;
@@ -136,7 +167,7 @@ impl Session {
             sampling_info["first_sample_position"] =
                 json!(self.checkpoint.position.saturating_sub(1));
         }
-        let prompt_ms = start.elapsed().as_secs_f64() * 1000.;
+        let prompt_ms = prefill.elapsed().as_secs_f64() * 1000.;
         let start = Instant::now();
         let mut generated = Vec::new();
         let mut drafts = 0;
@@ -148,6 +179,9 @@ impl Session {
                 "stream client disconnected"
             );
             if self.eos_tokens.contains(&first) {
+                if let Some(capture) = &mut speech {
+                    capture.observe_stop(first)?;
+                }
                 generated.push(first);
                 stopped = true;
                 break;
@@ -169,13 +203,17 @@ impl Session {
                 self.engine
                     .speculate(first, maximum - generated.len(), eos)?
             };
+            if let Some(capture) = &mut speech {
+                capture.observe(&self.engine, &confirmed)?;
+            }
             drafts += proposed;
             accepted += matched;
             self.tokens.extend_from_slice(&confirmed);
             generated.extend_from_slice(&confirmed);
-            if let Some(output) = output {
+            if let Some(output) = output.filter(|_| text_output) {
                 streaming.push(
-                    &tokenizer.decode(
+                    &self.decode_output(
+                        tokenizer,
                         &confirmed[..confirmed.len() - usize::from(confirmed.last() == Some(&eos))],
                     )?,
                     output,
@@ -197,14 +235,15 @@ impl Session {
         // Include queued MTP recovery work in the measured decode phase.
         self.engine.synchronize()?;
         let predicted_ms = start.elapsed().as_secs_f64() * 1000.;
-        let raw = String::from_utf8(
-            tokenizer.decode(&generated[..generated.len() - usize::from(stopped)])?,
-        )?;
-        if let Some(output) = output {
+        let raw = String::from_utf8(self.decode_output(
+            tokenizer,
+            &generated[..generated.len() - usize::from(stopped)],
+        )?)?;
+        if let Some(output) = output.filter(|_| text_output) {
             streaming.flush(output)?;
         }
         let tools = request.get("tools").cloned().unwrap_or(json!([]));
-        let message = crate::chat::parse(&raw, &tools)?;
+        let mut message = crate::chat::parse_with_thinking(&raw, &tools, output_thinking)?;
         let has_tools = message
             .get("tool_calls")
             .and_then(Json::as_array)
@@ -216,7 +255,18 @@ impl Session {
         } else {
             "stop"
         };
-        let result = json!({"id":super::stream::completion_id(),"created":super::stream::unix_seconds(),"object":"chat.completion","model":request.get("model").and_then(Json::as_str).unwrap_or("lia.rs"),"choices":[{"index":0,"message":message,"finish_reason":finish}],"usage":{"prompt_tokens":prompt.len(),"completion_tokens":generated.len(),"total_tokens":prompt.len()+generated.len(),"prompt_tokens_details":{"cached_tokens":cached}},"timings":{"sampling":sampling_info,"cache_n":cached,"prefill_batches":prefill_batches,"prompt_n":prompt.len()-cached,"prompt_ms":prompt_ms,"predicted_n":generated.len(),"predicted_ms":predicted_ms,"predicted_per_second":generated.len().saturating_sub(1) as f64*1000./predicted_ms,"draft_n":drafts,"draft_n_accepted":accepted,"mtp_mode":if self.engine.mtp_enabled(){"native MTP chain; batched target verification with captured per-position recurrent states"}else{"disabled"},"mtp_max_draft":self.engine.max_draft(),"activation_quantization":self.engine.integer_enabled()}});
+        let speech_timings = speech
+            .map(|capture| {
+                self.speech
+                    .as_ref()
+                    .context("speech output unavailable")?
+                    .finish(&self.engine, tokenizer, capture, &mut message, output)
+            })
+            .transpose()?;
+        let mut result = json!({"id":super::stream::completion_id(),"created":super::stream::unix_seconds(),"object":"chat.completion","model":request.get("model").and_then(Json::as_str).unwrap_or("lia.rs"),"choices":[{"index":0,"message":message,"finish_reason":finish}],"usage":{"prompt_tokens":prompt.len(),"completion_tokens":generated.len(),"total_tokens":prompt.len()+generated.len(),"prompt_tokens_details":{"cached_tokens":cached}},"timings":{"sampling":sampling_info,"cache_n":cached,"prefill_batches":prefill_batches,"frontend_ms":frontend_ms,"prompt_n":prompt.len()-cached,"prompt_ms":prompt_ms,"predicted_n":generated.len().saturating_sub(1),"predicted_ms":predicted_ms,"predicted_per_second":generated.len().saturating_sub(1) as f64*1000./predicted_ms,"draft_n":drafts,"draft_n_accepted":accepted,"mtp_mode":if self.engine.mtp_enabled(){"native MTP chain; batched target verification with captured per-position recurrent states"}else{"disabled"},"mtp_max_draft":self.engine.max_draft(),"activation_quantization":self.engine.integer_enabled()}});
+        if let Some(timings) = speech_timings {
+            result["timings"]["speech"] = timings;
+        }
         eprintln!(
             "request complete: prompt_tokens={} generation_tokens={} prompt_seconds={:.3} generation_seconds={:.3}",
             prompt.len(),

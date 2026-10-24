@@ -40,6 +40,20 @@ impl Engine {
             "invalid sampling logit shape"
         );
         let batch = logits.len() / vocabulary;
+        if sampling.settings().1 == 0 {
+            return logits
+                .to_host_vec(&self.stream)?
+                .chunks_exact(vocabulary)
+                .map(|row| {
+                    sampling.distribution(
+                        row.iter()
+                            .copied()
+                            .enumerate()
+                            .map(|(id, value)| (id as u32, value)),
+                    )
+                })
+                .collect();
+        }
         let parts = vocabulary.div_ceil(1024);
         let slots = parts * 20;
         let required = batch * slots;

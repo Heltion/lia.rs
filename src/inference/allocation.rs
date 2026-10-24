@@ -1,6 +1,7 @@
 //! Reserve the GPU working set before readiness, then lease bounded logical buffers.
 use super::*;
 use anyhow::Context;
+mod qwen3;
 
 const MIB: usize = 1024 * 1024;
 const RESERVE: usize = 512 * MIB;
@@ -26,7 +27,7 @@ fn scratch_layout(geometry: geometry::Geometry, batch: usize) -> Vec<(usize, usi
     }
 }
 
-fn reservation(
+pub(super) fn reservation(
     geometry: geometry::Geometry,
     batch: usize,
     attention: usize,
@@ -35,7 +36,11 @@ fn reservation(
         .into_iter()
         .map(|(elements, count)| elements * count * 4)
         .sum::<usize>()
-        + SMALL_ELEMENTS * 4;
+        + if geometry.llama {
+            (48 * 17408 * 8 + 18 * 130560 * 8) * 4
+        } else {
+            SMALL_ELEMENTS * 4
+        };
     // Dense projections need one FP16 plane. INT4 experts also preserve the
     // FP16 residual of their larger routed activation in the same workspace.
     let packed_words = if geometry.moe {
@@ -80,6 +85,9 @@ impl Engine {
     }
 
     pub(super) fn prepare_buffers(&mut self) -> Result<()> {
+        if self.geometry.qwen3 {
+            return self.prepare_qwen3_buffers();
+        }
         if !self.preallocated {
             return Ok(());
         }
@@ -93,6 +101,9 @@ impl Engine {
             cuda_core::DriverError(status)
         );
         let attention_bytes = |batch| {
+            if self.geometry.llama {
+                return super::llama::workspace(batch, self.capacity);
+            }
             attention_plan::reserved_bytes(
                 batch,
                 self.capacity,
@@ -124,7 +135,14 @@ impl Engine {
         {
             let mut pool = self.pool.borrow_mut();
             let mut layout = scratch_layout(self.geometry, batch);
-            layout.extend([(17408 * 8, 48), (self.vocabulary_size() * 8, 2)]);
+            // Bounded paged decode graphs retain their vocabulary outputs.
+            layout.extend([
+                (17408 * 8, 48),
+                (
+                    self.vocabulary_size() * 8,
+                    if self.geometry.llama { 18 } else { 2 },
+                ),
+            ]);
             for (elements, count) in layout {
                 let buffers = pool.entry(elements).or_default();
                 for _ in 0..count {

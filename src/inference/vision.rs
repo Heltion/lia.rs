@@ -5,21 +5,30 @@ mod inputs;
 mod load;
 mod minicpm;
 mod minicpm_precision;
+mod minicpmo;
 pub(in crate::inference) mod offload;
 mod operations;
 
-pub(super) struct ImageEmbedding {
-    start: usize,
-    data: DeviceBuffer<f32>,
-}
-
 impl Engine {
-    pub(super) fn past_image_embeddings(&self, position: usize) -> bool {
-        self.images
-            .iter()
-            .all(|image| position >= image.start + image.data.len() / self.geometry.hidden)
+    /// Encode a frame group in one vision residency interval, preserving the
+    /// language cache while parked weights are temporarily uploaded.
+    pub fn image_embeddings_many(&mut self, images: &[&PreparedImage]) -> Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(
+            !images.is_empty() && images.len() <= 32,
+            "invalid image slice batch"
+        );
+        self.with_vision_resident(|engine| {
+            images
+                .iter()
+                .map(|image| {
+                    engine
+                        .encode_image_resident(image)?
+                        .to_host_vec(&engine.stream)
+                        .map_err(Into::into)
+                })
+                .collect()
+        })
     }
-
     /// Diagnostic host export; the multimodal forward path can retain the GPU buffer.
     pub fn image_embeddings(&mut self, image: &PreparedImage) -> Result<Vec<f32>> {
         self.encode_image_buffer(image)?
@@ -36,6 +45,9 @@ impl Engine {
     }
 
     fn encode_image_resident(&self, image: &PreparedImage) -> Result<Buffer> {
+        if self.vision_encoder == crate::models::VisionEncoder::MiniCpmO45 {
+            return self.encode_minicpmo_image(image);
+        }
         if self.vision_encoder == crate::models::VisionEncoder::MiniCpmV47 {
             return self.encode_minicpm_image(image);
         }

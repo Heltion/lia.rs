@@ -121,3 +121,87 @@ Except as contained in this notice, the name of a copyright holder shall
 not be used in advertising or otherwise to promote the sale, use or other
 dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
+
+MiniCPM-o 4.5 architecture, tensor layouts and processing contracts were checked
+against OpenBMB's official MiniCPM-o-4_5-awq ModelScope checkpoint, revision
+46ba18b22ce7324c50ed97f5fc57b85b22d66e69:
+https://modelscope.cn/models/OpenBMB/MiniCPM-o-4_5-awq
+The upstream reference Python source identifies Copyright 2026 The OpenBMB Team
+and Apache License 2.0. The Rust inference and processing code is implemented
+independently. The reference code and model weights are not distributed here;
+model weights retain their upstream licensing terms.
+
+MiniCPM-o's token2wav encoder contracts and algorithms were checked against the
+CosyVoice2 modules distributed in step-audio2 1.0.0, selected by the official
+checkpoint's flow.yaml. The reference encoder, attention and feed-forward files
+identify Apache License 2.0 and the following copyright holders:
+Copyright (c) 2019 Shigeki Karita
+Copyright (c) 2020-2021 Mobvoi Inc (Binbin Zhang, Di Wu)
+Copyright (c) 2022 Xingchen Song
+Copyright (c) 2024 Alibaba Inc (Xiang Lyu)
+The corresponding Rust loading, convolution, attention and matrix operators
+are implemented independently; upstream Python code is not distributed here.
+
+MiniCPM-o's HiFT acoustic and F0 prediction contracts were also checked against
+vLLM-Omni revision d6db19b41f8c081506468859cd8f3910f77f1e5c and the
+PyTorch CUDA weight-normalization algorithm. These Apache License 2.0 reference
+sources identify Copyright contributors to the vLLM-Omni project,
+Copyright (c) 2024 Alibaba Inc (Xiang Lyu, Kai Hu), and PyTorch contributors.
+The Rust operators and loaders are independently implemented.
+
+The CAM++ speaker encoder architecture and ONNX weight mapping were checked
+against the same pinned vLLM-Omni revision and its in-tree 3D-Speaker CAM++
+reference. These Apache License 2.0 sources identify Copyright contributors
+to the vLLM and vLLM-Omni projects, and Copyright 3D-Speaker
+(https://github.com/alibaba-damo-academy/3D-Speaker). All Rights Reserved.
+The Rust ONNX reader, speaker encoder and GPU operators are independently
+implemented; no upstream Python implementation is distributed here.
+
+The S3 v2 speech tokenizer contracts were checked against the official
+checkpoint's ONNX export and the s3tokenizer reference package. Its Apache
+License 2.0 sources identify Copyright (c) Mddct (Dinghao Zhou),
+Copyright (c) 2023 OpenAI (Whisper Team), and Copyright (c) 2024 Tsinghua
+University (Xingchen Song). The Rust loader, tokenizer and GPU operators
+are independently implemented; reference Python code is not distributed.
+
+The independent Rust windowed-sinc resampler was checked against torchaudio
+2.11.0 cached-kernel resampling. The reference code is not used at runtime.
+The reference implementation carries the following attribution and license:
+
+BSD 2-Clause License
+
+Copyright (c) 2017 Facebook Inc. (Soumith Chintala),
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+ONNX TensorProto and graph field contracts were checked against the official
+ONNX schemas and Python parser (https://github.com/onnx/onnx), licensed under
+Apache License 2.0, Copyright ONNX Project Contributors. The bounded Rust
+protobuf/tensor reader is independently implemented and does not link or invoke
+an ONNX inference runtime.
+
+MiniCPM-o duplex turn-end budgets, codec silence classes, and sentence-tail
+stopping rules were checked against the pinned vLLM-Omni revision named above.
+These Apache License 2.0 sources identify Copyright contributors to the
+vLLM-Omni project. The Rust control and inference implementation is independent;
+upstream Python is not distributed or invoked by lia.rs.

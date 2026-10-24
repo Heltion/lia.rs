@@ -7,35 +7,9 @@ impl Engine {
         input: &DeviceBuffer<f32>,
         batch: usize,
     ) -> Result<Buffer> {
-        let name = format!("vision.{name}");
-        anyhow::ensure!(batch > 0, "empty vision matrix batch");
-        let columns = input.len() / batch;
-        anyhow::ensure!(
-            input.len().is_multiple_of(batch),
-            "invalid vision matrix input"
-        );
-        let padded = self.weight(&name)?.shape[0];
-        if columns == padded {
-            return self.mm(&name, input);
-        }
-        anyhow::ensure!(
-            columns < padded && padded - columns < 256,
-            "invalid padded vision matrix"
-        );
-        let mut aligned = self.zeros(padded * batch)?;
-        // SAFETY: input covers batch complete logical rows; destination covers
-        // batch complete padded rows, and zero tails never read input.
-        unsafe {
-            self.module.vision.pad_rows(
-                &self.stream,
-                LaunchConfig::for_num_elems(aligned.len() as u32),
-                columns,
-                padded,
-                input,
-                &mut aligned,
-            )?;
-        }
-        self.mm(&name, &aligned)
+        let compensate = self.vision_encoder == crate::models::VisionEncoder::MiniCpmO45
+            && std::env::var("LIA_MINICPM_VISION_BF16").as_deref() != Ok("1");
+        self.component_mm(&format!("vision.{name}"), input, batch, compensate)
     }
 
     pub(super) fn vision_norm(&self, prefix: &str, input: &DeviceBuffer<f32>) -> Result<Buffer> {

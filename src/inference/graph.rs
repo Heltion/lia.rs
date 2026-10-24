@@ -3,7 +3,10 @@ use super::*;
 use anyhow::Context;
 use cuda_core::sys;
 pub(super) mod branch;
+pub(super) mod paged;
+pub(super) mod qwen3;
 pub(super) mod replay;
+mod scalar;
 
 fn check(status: sys::CUresult, operation: &str) -> Result<()> {
     anyhow::ensure!(
@@ -133,11 +136,20 @@ impl Engine {
         let graph = capture.end();
         let value = result?;
         let graph = graph.context("capturing GPU forward execution")?;
+        if self.decode_pool_active.get() && key == (1, 1, false, false) {
+            let replay = qwen3::Replay::new(graph, self)?;
+            replay.exec.launch(&self.stream)?;
+            *self.qwen3_decode_replay.borrow_mut() = Some(replay);
+            let mut stats = self.graph_stats.borrow_mut();
+            stats[0] += 1;
+            stats[2] += 1;
+            return Ok(value);
+        }
         if key == (1, 1, false, false)
             && self.geometry.moe
             && !self.geometry.mtp
             && self.preallocated
-            && self.past_image_embeddings(self.position - 1)
+            && self.past_media_embeddings(self.position - 1)
             && std::env::var("LIA_DECODE_REPLAY").as_deref() != Ok("0")
             && self
                 .rotary
@@ -196,5 +208,7 @@ impl Drop for Engine {
         // Drain launches before destroying executable graphs and their backing allocations.
         let _ = self.stream.synchronize();
         self.graphs.get_mut().clear();
+        self.qwen3_decode_replay.get_mut().take();
+        self.paged_replays.get_mut().clear();
     }
 }

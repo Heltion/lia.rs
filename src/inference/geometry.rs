@@ -1,6 +1,8 @@
 //! Dimensions shared by state allocation and kernel launch planning.
 #[derive(Clone, Copy)]
 pub(super) struct Geometry {
+    pub llama: bool,
+    pub qwen3: bool,
     pub hidden: usize,
     pub layers: usize,
     pub query_heads: usize,
@@ -13,6 +15,8 @@ pub(super) struct Geometry {
 impl Geometry {
     pub fn dense() -> Self {
         Self {
+            llama: false,
+            qwen3: false,
             hidden: 5120,
             layers: 64,
             query_heads: 24,

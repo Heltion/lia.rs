@@ -46,6 +46,10 @@ impl Engine {
     }
 
     pub fn prefill_chunk(&self, remaining: usize) -> Result<usize> {
+        if (self.geometry.llama || self.geometry.qwen3) && self.preallocated {
+            anyhow::ensure!(remaining > 0, "empty prefill chunk request");
+            return Ok(remaining.min(self.prefill_batch));
+        }
         if self.preallocated {
             let workspace = self
                 .attention_work

@@ -145,4 +145,76 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    #[ignore = "requires official MiniCPM-o AWQ checkpoint and CUDA"]
+    fn real_vocabulary_head_preserves_all_logit_bits() -> Result<()> {
+        use anyhow::{Context, ensure};
+        let directory =
+            std::env::var("LIA_MINICPMO45_MODEL").context("set LIA_MINICPMO45_MODEL")?;
+        let archive = crate::safetensors::Archive::open(directory)?;
+        let tensor = archive.tensor("llm.lm_head.weight")?;
+        ensure!(
+            tensor.dtype == crate::safetensors::Dtype::Bf16 && tensor.shape.len() == 2,
+            "expected BF16 vocabulary matrix"
+        );
+        let (rows, columns) = (tensor.shape[0], tensor.shape[1]);
+        ensure!(
+            columns.is_multiple_of(128),
+            "incomplete vocabulary input groups"
+        );
+        let context = CudaContext::new(0)?;
+        let stream = context.default_stream();
+        let module = super::super::load(&context)?;
+        let dw = DeviceBuffer::from_host(&stream, &archive.read("llm.lm_head.weight")?)?;
+        let guard = 12345.0f32;
+        for scale in [0.0137f32, 1.031] {
+            let x: Vec<f32> = (0..columns)
+                .map(|i| ((i * 37 % 997) as f32 - 498.) * scale)
+                .collect();
+            let dx = DeviceBuffer::from_host(&stream, &x)?;
+            let actual = DeviceBuffer::from_host(&stream, &vec![guard; rows + 17])?;
+            let reference = DeviceBuffer::from_host(&stream, &vec![guard; rows + 17])?;
+            // SAFETY: exact BF16 tensor dimensions, complete128-column groups,
+            // aligned device storage and full-warps with disjoint output rows.
+            unsafe {
+                module.bf16_router.bf16_router_matvec(
+                    &stream,
+                    LaunchConfig::for_num_elems((rows * 32) as u32),
+                    columns,
+                    rows,
+                    1,
+                    &dw,
+                    &dx,
+                    actual.cu_deviceptr() as *mut f32,
+                )?;
+                module.matrix.matvec_packed::<30, 2, 1>(
+                    &stream,
+                    LaunchConfig::for_num_elems((rows * 32) as u32),
+                    columns,
+                    rows,
+                    &dw,
+                    &dx,
+                    reference.cu_deviceptr() as *mut f32,
+                )?;
+            }
+            let a = actual.to_host_vec(&stream)?;
+            let b = reference.to_host_vec(&stream)?;
+            ensure!(
+                a[..rows].iter().all(|x| x.is_finite()),
+                "nonfinite vocabulary logit"
+            );
+            ensure!(
+                a.iter().zip(&b).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "aligned vocabulary logits changed bits"
+            );
+            ensure!(
+                a[rows..].iter().chain(&b[rows..]).all(|x| *x == guard),
+                "vocabulary output guard overwritten"
+            );
+            println!(
+                "real vocabulary rows={rows} cols={columns} scale={scale}: all logits bit-exact, guards intact"
+            );
+        }
+        Ok(())
+    }
 }

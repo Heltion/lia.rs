@@ -73,7 +73,7 @@ impl Engine {
         self.mini_affine(projected, &format!("{prefix}.attn_out.bias"), false, bf16)
     }
 
-    fn mini_block(
+    pub(super) fn mini_block(
         &self,
         prefix: &str,
         hidden: &DeviceBuffer<f32>,

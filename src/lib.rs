@@ -10,12 +10,15 @@ pub mod image_tools;
 #[cfg(feature = "cuda")]
 pub mod inference;
 pub mod models;
+pub mod onnx_weights;
+mod prefix_cache;
 pub mod quant;
 pub mod safetensors;
 pub mod sampling;
 #[cfg(feature = "cuda")]
 pub mod server;
 pub mod tokenizer;
+pub mod torch_weights;
 pub mod vision;
 
 /// Validated index bound; model metadata may declare a smaller context.

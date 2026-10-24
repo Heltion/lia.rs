@@ -18,14 +18,17 @@ impl Engine {
             .ok_or_else(|| anyhow!("expected F32 tensor {name}"))
     }
     pub(super) fn zeros(&self, n: usize) -> Result<Buffer> {
+        let pool = if self.decode_pool_active.get() {
+            &self.decode_pool
+        } else {
+            &self.pool
+        };
         let recycled = if self.preallocated {
-            self.pool
-                .borrow_mut()
+            pool.borrow_mut()
                 .range_mut(n..)
                 .find_map(|(&capacity, buffers)| buffers.pop().map(|data| (capacity, data)))
         } else {
-            self.pool
-                .borrow_mut()
+            pool.borrow_mut()
                 .get_mut(&n)
                 .and_then(|buffers| buffers.pop())
                 .map(|data| (n, data))
@@ -45,7 +48,7 @@ impl Engine {
             }
         };
         debug_assert_eq!(capacity, data.len());
-        Buffer::lease(data, n, self.pool.clone())
+        Buffer::lease(data, n, pool.clone())
     }
 
     pub(super) fn mm(&self, name: &str, input: &DeviceBuffer<f32>) -> Result<Buffer> {
@@ -57,6 +60,24 @@ impl Engine {
         input: &DeviceBuffer<f32>,
         reuse_input: bool,
     ) -> Result<Buffer> {
+        if let Some(weight) = self.awq_weights.get(name) {
+            anyhow::ensure!(!self.kv_offloaded, "attention cache is offloaded");
+            let mut output = self.zeros(weight.output_elements(input.len())?)?;
+            let workspace_elements = weight.workspace_elements(input.len())?;
+            let mut workspace = if workspace_elements == 0 {
+                None
+            } else {
+                Some(self.zeros(workspace_elements)?)
+            };
+            weight.matmul(
+                &self.module,
+                &self.stream,
+                input,
+                workspace.as_mut().map(|b| &mut **b),
+                &mut output,
+            )?;
+            return Ok(output);
+        }
         let w = self.weight(name)?;
         if w.shape.len() != 2 || !input.len().is_multiple_of(w.shape[0]) {
             return Err(anyhow!("matrix shape mismatch: {name}"));
@@ -73,7 +94,9 @@ impl Engine {
         let mut output = self.zeros(rows * batch)?;
         // SAFETY: validated matrix layout, matching input and allocated output;
         // every warp has one disjoint output row.
-        if w.group.is_some() {
+        if self.geometry.llama && self.bf16_vector && w.kind == 30 && batch <= 8 {
+            self.llama_bf16_matrix(w, input, &output)?;
+        } else if w.group.is_some() {
             self.gsq_mm(w, input, reuse_input, &mut output)?;
         } else if batch >= crate::gpu::WIDE_MIN_BATCH
             && let Some(weight_scale) = w.fp8_scale
@@ -129,11 +152,15 @@ impl Engine {
                     None
                 },
             )?;
-        } else if w.kind == 30 && rows == 256 && cols.is_multiple_of(128) {
-            // Keep router operands in FP32 across single-token and batched paths.
+        } else if w.kind == 30
+            && cols.is_multiple_of(128)
+            && ((self.geometry.moe && rows == 256)
+                || (self.geometry.qwen3 && batch == 1 && rows == self.vocabulary_size()))
+        {
+            // Preserve FP32 operands for routing and the Qwen3 vocabulary head.
             anyhow::ensure!(
                 rows.checked_mul(cols).and_then(|n| n.checked_mul(2)) == Some(w.data.len()),
-                "invalid BF16 router weight extent"
+                "invalid aligned BF16 projection weight extent"
             );
             // SAFETY: complete aligned BF16 rows and 128-column groups. Each
             // full warp preserves the original lane FMA and reduction order.
@@ -141,8 +168,13 @@ impl Engine {
                 self.module.bf16_router.bf16_router_matvec(
                     &self.stream,
                     LaunchConfig {
-                        grid_dim: ((rows * batch * 32).div_ceil(64) as u32, 1, 1),
-                        block_dim: (64, 1, 1),
+                        grid_dim: (
+                            (rows * batch * 32).div_ceil(if self.geometry.qwen3 { 256 } else { 64 })
+                                as u32,
+                            1,
+                            1,
+                        ),
+                        block_dim: (if self.geometry.qwen3 { 256 } else { 64 }, 1, 1),
                         shared_mem_bytes: 0,
                     },
                     cols,
@@ -193,14 +225,15 @@ impl Engine {
             // SAFETY: checked matrices and workspace on one stream. Reuse is
             // confined to mm_many's identical immutable input and shared width.
             unsafe {
+                let shadow = self.llama_weight_cache.get(name);
                 crate::gpu::launch_prefill_matrix(
                     &self.module,
                     &self.stream,
-                    w.kind,
+                    if shadow.is_some() { 1 } else { w.kind },
                     cols,
                     rows,
                     batch,
-                    &w.data,
+                    shadow.unwrap_or(&w.data),
                     input,
                     reuse_input,
                     packed,
@@ -286,7 +319,27 @@ impl Engine {
         let output = self.zeros(input.len())?;
         // SAFETY: complete disjoint groups, with matching normalization weights.
         unsafe {
-            if dim >= 512 {
+            if self.geometry.qwen3
+                && self.qwen3_vector_norm
+                && dim == 4096
+                && groups == 1
+                && input.cu_deviceptr().is_multiple_of(16)
+                && weight.cu_deviceptr().is_multiple_of(16)
+                && output.cu_deviceptr().is_multiple_of(16)
+            {
+                self.module.rms_vector.rms_norm_vector4096(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    self.eps,
+                    input,
+                    weight,
+                    output.cu_deviceptr() as *mut f32,
+                )?;
+            } else if dim >= 512 {
                 self.module.normalization.rms_norm_block(
                     &self.stream,
                     LaunchConfig {

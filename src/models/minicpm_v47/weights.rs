@@ -1,5 +1,5 @@
 //! MiniCPM-V's SigLIP, early window merger, and language projector tensor names.
-use crate::models::vision::{Parameter, Part};
+use crate::models::parameters::{Parameter, Part};
 use anyhow::{Result, ensure};
 use serde_json::Value;
 
@@ -39,6 +39,7 @@ fn attention(out: &mut Vec<Parameter>, target: &str, source: &str) {
             parts,
             shape,
             matrix,
+            transpose: false,
         });
     }
     linear(
@@ -93,6 +94,7 @@ pub(crate) fn plan(config: &Value) -> Result<Vec<Parameter>> {
         )],
         shape: vec![1152, 588],
         matrix: true,
+        transpose: false,
     });
     out.push(Parameter::floats(
         "vision.v.patch_embd.bias",

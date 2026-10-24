@@ -14,6 +14,8 @@ pub use inspection::kernel_info;
 
 pub(crate) const MAX_PREFILL_BATCH: usize = 4096;
 
+pub(crate) mod awq;
+pub(crate) mod float_matrix;
 pub(crate) mod fp8;
 pub(crate) mod fp8_cache;
 pub(crate) mod gsq;
@@ -337,3 +339,5 @@ mod tests {
 
 #[cfg(test)]
 mod attention_bf16;
+pub(crate) mod llama_attention;
+pub(crate) mod nucleus;

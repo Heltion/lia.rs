@@ -6,8 +6,12 @@ use crate::{
     safetensors::{Archive, Dtype},
 };
 use anyhow::{Context, ensure};
+mod minicpm5;
+mod minicpmo;
+mod minicpmo_audio;
+mod minicpmo_speech;
+mod parameters;
 mod vision;
-mod vision_weights;
 mod weights;
 
 struct Loader<'a> {
@@ -20,6 +24,12 @@ struct Loader<'a> {
 impl Engine {
     pub fn load_huggingface(directory: &str, capacity: usize, vision: bool) -> Result<Self> {
         let checkpoint = crate::models::Checkpoint::open(directory)?;
+        if checkpoint.architecture == crate::models::Architecture::MiniCpm5 {
+            return Self::load_minicpm5(directory, capacity, &checkpoint);
+        }
+        if checkpoint.architecture == crate::models::Architecture::MiniCpmO45 {
+            return Self::load_minicpmo(directory, capacity, &checkpoint, vision);
+        }
         let config = &checkpoint.config;
         checkpoint.validate_capacity(capacity)?;
         let eps = checkpoint.rms_epsilon;
@@ -92,7 +102,7 @@ impl Engine {
         }
         if vision {
             if checkpoint.architecture == crate::models::Architecture::MiniCpmV47 {
-                loader.vision_parameters(
+                loader.parameters(
                     crate::models::minicpm_v47::weights::plan(config)?,
                     &mut weights,
                 )?;
@@ -101,6 +111,8 @@ impl Engine {
             }
         }
         let geometry = Geometry {
+            llama: false,
+            qwen3: false,
             hidden: 2048,
             layers: 40,
             query_heads: 16,

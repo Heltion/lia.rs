@@ -4,6 +4,11 @@ use anyhow::Context;
 impl Engine {
     pub(super) fn feed_forward(&self, layer: usize, input: &DeviceBuffer<f32>) -> Result<Buffer> {
         let prefix = format!("blk.{layer}");
+        if self.geometry.qwen3
+            && let Some(output) = self.qwen3_awq_feed_forward(&prefix, input)?
+        {
+            return Ok(output);
+        }
         // Decode GSQ projections read their input directly; routed register
         // experts have separate workspaces. Keep shared intermediates leased
         // until both branches join so the pool cannot alias concurrent work.
@@ -187,5 +192,93 @@ impl Engine {
             )?;
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires official MiniCPM-o AWQ checkpoint and CUDA"]
+    fn joined_awq_gateup_matches_independent_projections() -> Result<()> {
+        let archive = crate::safetensors::Archive::open(std::env::var("LIA_MINICPMO45_MODEL")?)?;
+        let matrices = ["gate_proj", "up_proj"]
+            .map(|name| {
+                crate::quant::awq::Matrix::load(
+                    &archive,
+                    &format!("llm.model.layers.0.mlp.{name}"),
+                    128,
+                )
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let context = CudaContext::new(0)?;
+        let stream = context.default_stream();
+        let module = kernels::load(&context)?;
+        let joined = crate::gpu::awq::Weights::upload(
+            &stream,
+            &crate::quant::awq::Matrix::concatenate(&matrices)?,
+        )?;
+        let separate = matrices
+            .iter()
+            .map(|m| crate::gpu::awq::Weights::upload(&stream, m))
+            .collect::<Result<Vec<_>>>()?;
+        let apply = |weight: &crate::gpu::awq::Weights,
+                     x: &DeviceBuffer<f32>|
+         -> Result<DeviceBuffer<f32>> {
+            let mut output = DeviceBuffer::zeroed(&stream, weight.output_elements(x.len())?)?;
+            let n = weight.workspace_elements(x.len())?;
+            let mut partial = if n == 0 {
+                None
+            } else {
+                Some(DeviceBuffer::zeroed(&stream, n)?)
+            };
+            weight.matmul(&module, &stream, x, partial.as_mut(), &mut output)?;
+            Ok(output)
+        };
+        for batch in [1usize, 34, 65, 512] {
+            let x: Vec<f32> = (0..batch * 4096)
+                .map(|i| ((i * 17 % 257) as f32 - 128.) * 0.0137)
+                .collect();
+            let x = DeviceBuffer::from_host(&stream, &x)?;
+            let combined = apply(&joined, &x)?;
+            let gate = apply(&separate[0], &x)?;
+            let up = apply(&separate[1], &x)?;
+            let mut expected = DeviceBuffer::zeroed(&stream, batch * 12288)?;
+            let mut actual = DeviceBuffer::zeroed(&stream, batch * 12288)?;
+            let config = LaunchConfig::for_num_elems(u32::try_from(actual.len())?);
+            // SAFETY: fixed validated FFN rows, complete concatenated halves,
+            // identical input and disjoint bounded activation destinations.
+            unsafe {
+                module
+                    .basic
+                    .silu_joined(&stream, config, 12288, &combined, &mut actual)?;
+                module
+                    .basic
+                    .silu_mul(&stream, config, &up, &gate, &mut expected)?;
+            }
+            let combined = combined.to_host_vec(&stream)?;
+            for (index, source) in [gate, up].into_iter().enumerate() {
+                let source = source.to_host_vec(&stream)?;
+                for (i, value) in source.iter().enumerate() {
+                    let at = i / 12288 * 24576 + index * 12288 + i % 12288;
+                    anyhow::ensure!(
+                        combined[at].to_bits() == value.to_bits(),
+                        "joined FFN projection {index} batch={batch} index={i}"
+                    );
+                }
+            }
+            anyhow::ensure!(
+                actual
+                    .to_host_vec(&stream)?
+                    .iter()
+                    .zip(expected.to_host_vec(&stream)?)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "joined FFN activation batch={batch}"
+            );
+            println!("AWQ gate/up batch={batch}: projections and activation bitexact");
+        }
+        Ok(())
     }
 }

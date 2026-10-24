@@ -67,6 +67,16 @@ impl Engine {
         names: [&str; N],
         input: &DeviceBuffer<f32>,
     ) -> Result<[Buffer; N]> {
+        if names
+            .iter()
+            .any(|name| self.awq_weights.contains_key(*name))
+        {
+            let mut outputs: [Option<Buffer>; N] = std::array::from_fn(|_| None);
+            for (out, name) in outputs.iter_mut().zip(names) {
+                *out = Some(self.mm(name, input)?);
+            }
+            return Ok(outputs.map(Option::unwrap));
+        }
         let first = names
             .first()
             .ok_or_else(|| anyhow!("empty projection group"))?;
@@ -92,7 +102,9 @@ impl Engine {
                 let full_precision = weight.group.is_none()
                     && weight.kind == 30
                     && (weight.shape[1] <= 96
-                        || (weight.shape[1] == 256 && cols.is_multiple_of(128)));
+                        || (self.geometry.moe
+                            && weight.shape[1] == 256
+                            && cols.is_multiple_of(128)));
                 ready |= (batch > 8 && !full_precision)
                     || (self.integer && weight.kind != 0 && weight.kind != 30);
             }

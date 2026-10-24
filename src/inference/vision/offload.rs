@@ -49,6 +49,7 @@ impl Engine {
         anyhow::ensure!(!self.kv_offloaded, "attention cache is already offloaded");
         self.stream.synchronize()?;
         self.decode_replay.borrow_mut().take();
+        self.qwen3_decode_replay.borrow_mut().take();
         self.graphs.borrow_mut().clear();
         // Finish every fallible read before changing live state. Empty caches
         // need no transfer; populated diagnostic calls preserve all bits.
@@ -129,6 +130,7 @@ impl Engine {
         self.stream.synchronize()?;
         // Both classes of graph can contain addresses invalidated by a swap.
         self.decode_replay.borrow_mut().take();
+        self.qwen3_decode_replay.borrow_mut().take();
         self.graphs.borrow_mut().clear();
         for name in self.host_vision.keys() {
             let weight = self
@@ -267,8 +269,8 @@ mod tests {
         }
         let expected_features = engine.image_embeddings(&images[0].1)?;
         engine.prepare_image_inputs(&images, plan)?;
-        assert_eq!(engine.images.len(), 6);
-        let retained = engine.images[0].data.to_host_vec(&engine.stream)?;
+        assert_eq!(engine.embeddings.len(), 6);
+        let retained = engine.embeddings[0].data.to_host_vec(&engine.stream)?;
         assert!(
             retained
                 .iter()

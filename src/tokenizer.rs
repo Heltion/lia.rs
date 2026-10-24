@@ -1,8 +1,12 @@
-//! Byte-level BPE, with Qwen 3.5 Unicode pre-tokenization.
+//! Checkpoint-defined byte-level BPE and text pre-tokenization.
 use crate::gguf::{Model, Value};
 use anyhow::anyhow;
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 use unicode_normalization::UnicodeNormalization;
+mod bpe;
 mod huggingface;
 
 pub struct Tokenizer {
@@ -10,12 +14,17 @@ pub struct Tokenizer {
     pieces: Vec<Vec<u8>>,
     ranks: HashMap<(String, String), usize>,
     encode_byte: [char; 256],
-    split: fancy_regex::Regex,
+    split: Vec<fancy_regex::Regex>,
     special: Vec<(String, u32)>,
     added: Vec<(String, u32)>,
     normalize_nfc: bool,
+    control_ids: HashSet<u32>,
+    bpe_cache: Mutex<HashMap<String, Vec<u32>>>,
 }
 impl Tokenizer {
+    pub fn is_control(&self, token: u32) -> bool {
+        self.control_ids.contains(&token)
+    }
     pub fn from_model(model: &Model) -> anyhow::Result<Self> {
         if !matches!(model.metadata.get("tokenizer.ggml.pre"), Some(Value::String(s)) if s == "qwen35")
         {
@@ -61,6 +70,7 @@ impl Tokenizer {
         let mut vocab = HashMap::new();
         let mut pieces = Vec::new();
         let mut special = Vec::new();
+        let mut control_ids = HashSet::new();
         for (id, (token, kind)) in tokens.iter().zip(types).enumerate() {
             let Value::String(token) = token else {
                 return Err(anyhow!("non-string token"));
@@ -68,6 +78,9 @@ impl Tokenizer {
             let Value::Signed(kind) = kind else {
                 return Err(anyhow!("invalid token type"));
             };
+            if *kind == 3 {
+                control_ids.insert(id as u32);
+            }
             if *kind == 3 || *kind == 4 {
                 special.push((token.clone(), id as u32));
             }
@@ -106,10 +119,12 @@ impl Tokenizer {
             pieces,
             ranks,
             encode_byte,
-            split,
+            split: vec![split],
             special,
             added: Vec::new(),
             normalize_nfc: false,
+            control_ids,
+            bpe_cache: Mutex::new(HashMap::new()),
         })
     }
     pub fn encode(&self, text: &str, parse_special: bool) -> anyhow::Result<Vec<u32>> {
@@ -132,35 +147,29 @@ impl Tokenizer {
                     .min_by_key(|(i, len, _)| (*i, std::cmp::Reverse(*len)))
             };
             let end = next.map_or(text.len(), |(i, _, _)| i);
-            for found in self.split.find_iter(&text[offset..end]) {
-                let found = found?;
-                let mut parts: Vec<String> = found
-                    .as_str()
-                    .bytes()
-                    .map(|b| self.encode_byte[b as usize].to_string())
-                    .collect();
-                loop {
-                    let best = parts
-                        .windows(2)
-                        .enumerate()
-                        .filter_map(|(i, pair)| {
-                            self.ranks
-                                .get(&(pair[0].clone(), pair[1].clone()))
-                                .map(|rank| (*rank, i))
-                        })
-                        .min();
-                    let Some((_, index)) = best else { break };
-                    let right = parts.remove(index + 1);
-                    parts[index].push_str(&right);
+            let mut pieces = vec![&text[offset..end]];
+            for pattern in &self.split {
+                let mut next = Vec::new();
+                for piece in pieces {
+                    let mut consumed = 0;
+                    for found in pattern.find_iter(piece) {
+                        let found = found?;
+                        if found.start() > consumed {
+                            next.push(&piece[consumed..found.start()]);
+                        }
+                        if !found.as_str().is_empty() {
+                            next.push(found.as_str());
+                        }
+                        consumed = found.end();
+                    }
+                    if consumed < piece.len() {
+                        next.push(&piece[consumed..]);
+                    }
                 }
-                for part in parts {
-                    out.push(
-                        *self
-                            .vocab
-                            .get(&part)
-                            .ok_or_else(|| anyhow!("BPE piece absent from vocabulary"))?,
-                    );
-                }
+                pieces = next;
+            }
+            for piece in pieces {
+                self.encode_piece(piece, &mut out)?;
             }
             if let Some((i, len, id)) = next {
                 out.push(id);
@@ -171,6 +180,16 @@ impl Tokenizer {
         }
         Ok(out)
     }
+    /// Decode user-visible text while retaining added tokens not marked special.
+    pub fn decode_text(&self, ids: &[u32]) -> anyhow::Result<Vec<u8>> {
+        let kept: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.control_ids.contains(id))
+            .collect();
+        self.decode(&kept)
+    }
+
     pub fn decode(&self, ids: &[u32]) -> anyhow::Result<Vec<u8>> {
         let mut out = Vec::new();
         for id in ids {
@@ -181,5 +200,27 @@ impl Tokenizer {
             );
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn text_decoding_skips_control_tokens_without_removing_structural_tags() -> anyhow::Result<()> {
+        let tokens =
+            ["a", "<|tts_eos|>", "<think>", "<tool_call>"].map(|s| Value::String(s.into()));
+        let types = [1, 3, 4, 4].map(Value::Signed);
+        let tokenizer = Tokenizer::from_arrays(&tokens, &types, &[])?;
+        assert_eq!(
+            tokenizer.decode(&[0, 1, 2, 3])?,
+            b"a<|tts_eos|><think><tool_call>"
+        );
+        assert_eq!(
+            tokenizer.decode_text(&[0, 1, 2, 3])?,
+            b"a<think><tool_call>"
+        );
+        assert!(tokenizer.decode_text(&[999]).is_err());
+        Ok(())
     }
 }

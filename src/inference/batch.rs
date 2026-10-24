@@ -26,7 +26,7 @@ impl Engine {
                 &mut hidden,
             )?;
         }
-        self.apply_image_embeddings(&hidden, position)?;
+        self.apply_media_embeddings(&hidden, position)?;
         Ok(hidden)
     }
 
@@ -57,7 +57,7 @@ impl Engine {
                 &mut out,
             )?;
         }
-        self.apply_image_embeddings(&out, self.position)?;
+        self.apply_media_embeddings(&out, self.position)?;
         Ok(out)
     }
     pub(super) fn mtp_many(&self, tokens: &[u32], target: &DeviceBuffer<f32>) -> Result<()> {

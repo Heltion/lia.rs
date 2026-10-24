@@ -2,6 +2,16 @@
 use crate::gguf::{Model, Value};
 use anyhow::{Result, anyhow};
 use serde_json::{Value as Json, json};
+mod huggingface;
+pub use huggingface::{huggingface_template, string_messages};
+#[cfg(any(feature = "cuda", test))]
+mod response;
+#[cfg(any(feature = "cuda", test))]
+pub use response::{parse, parse_with_thinking};
+
+pub fn thinking_enabled(request: &Json) -> bool {
+    request["chat_template_kwargs"]["enable_thinking"] != false
+}
 
 struct SpacedJson;
 impl serde_json::ser::Formatter for SpacedJson {
@@ -32,6 +42,10 @@ pub fn render(model: &Model, request: &Json) -> Result<String> {
 }
 
 pub fn render_template(template: &str, request: &Json) -> Result<String> {
+    render_template_with_bos(template, request, "")
+}
+
+pub fn render_template_with_bos(template: &str, request: &Json, bos_token: &str) -> Result<String> {
     let mut env = minijinja::Environment::new();
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_function(
@@ -98,7 +112,7 @@ pub fn render_template(template: &str, request: &Json) -> Result<String> {
             message["role"] = json!("system");
         }
     }
-    let mut context = json!({"messages": messages,"tools":tools,"add_generation_prompt":true,"enable_thinking":true,"reasoning_effort":request.get("reasoning_effort").cloned().unwrap_or(json!("xhigh")),"preserve_reasoning":true});
+    let mut context = json!({"bos_token":bos_token,"messages": messages,"tools":tools,"add_generation_prompt":true,"enable_thinking":true,"reasoning_effort":request.get("reasoning_effort").cloned().unwrap_or(json!("xhigh")),"preserve_reasoning":true});
     if let Some(kwargs) = request.get("chat_template_kwargs") {
         for (k, v) in kwargs
             .as_object()
@@ -107,106 +121,10 @@ pub fn render_template(template: &str, request: &Json) -> Result<String> {
             context[k] = v.clone();
         }
     }
-    if context["enable_thinking"] != true {
-        return Err(anyhow!(
-            "thinking must remain enabled for this implementation"
-        ));
+    if !context["enable_thinking"].is_boolean() {
+        return Err(anyhow!("enable_thinking must be a boolean"));
     }
     Ok(env.get_template("chat")?.render(context)?)
-}
-
-#[cfg(any(feature = "cuda", test))]
-pub fn parse(raw: &str, tools: &Json) -> Result<Json> {
-    let end = raw.find("</think>");
-    let call = raw.find("<tool_call>");
-    let (thought, text) = if let Some(call) = call.filter(|&call| end.is_none_or(|end| call < end))
-    {
-        // The tool delimiter also ends reasoning when no explicit end preceded it.
-        (&raw[..call], raw[call..].trim())
-    } else if let Some(end) = end {
-        (&raw[..end], raw[end + "</think>".len()..].trim())
-    } else {
-        // Every supported chat template opens a thinking span. An unfinished
-        // span remains reasoning, including when generation stops naturally.
-        (raw, "")
-    };
-    let mut thought = thought.trim();
-    while let Some(rest) = thought.strip_prefix("<think>") {
-        thought = rest.trim_start();
-    }
-    let reasoning = thought.to_string();
-    let mut calls = Vec::new();
-    let mut remainder = text;
-    let mut first_call = None;
-    while let Some(start) = remainder.find("<tool_call>") {
-        first_call.get_or_insert(text.len() - remainder.len() + start);
-        let body_start = start + "<tool_call>".len();
-        let end = remainder[body_start..]
-            .find("</tool_call>")
-            .ok_or_else(|| anyhow!("unclosed tool call"))?
-            + body_start;
-        let body = remainder[body_start..end].trim();
-        let func = body
-            .strip_prefix("<function=")
-            .ok_or_else(|| anyhow!("missing function tag"))?;
-        let name_end = func
-            .find('>')
-            .ok_or_else(|| anyhow!("unclosed function tag"))?;
-        let name = &func[..name_end];
-        let definition = tools
-            .as_array()
-            .ok_or_else(|| anyhow!("tools must be an array"))?
-            .iter()
-            .find_map(|t| {
-                let f = t.get("function")?;
-                (f.get("name")?.as_str()? == name).then_some(f)
-            });
-        let parameters = definition
-            .and_then(|f| f.get("parameters"))
-            .and_then(|p| p.get("properties"))
-            .and_then(Json::as_object);
-        let mut args = serde_json::Map::new();
-        let mut params = &func[name_end + 1..];
-        while let Some(start) = params.find("<parameter=") {
-            let key_start = start + "<parameter=".len();
-            let key_end = params[key_start..]
-                .find('>')
-                .ok_or_else(|| anyhow!("unclosed parameter tag"))?
-                + key_start;
-            let key = &params[key_start..key_end];
-            let value_end = params[key_end + 1..]
-                .find("</parameter>")
-                .ok_or_else(|| anyhow!("unclosed parameter value"))?
-                + key_end
-                + 1;
-            let text = params[key_end + 1..value_end].trim();
-            let kind = parameters
-                .and_then(|p| p.get(key))
-                .and_then(|p| p.get("type"))
-                .and_then(Json::as_str)
-                .unwrap_or("string");
-            let value = match kind {
-                "string" => Json::String(text.to_owned()),
-                "boolean" if text == "True" || text == "False" => Json::Bool(text == "True"),
-                _ if text == "None" => Json::Null,
-                _ => serde_json::from_str(text).unwrap_or_else(|_| Json::String(text.to_owned())),
-            };
-            if args.insert(key.to_owned(), value).is_some() {
-                return Err(anyhow!("duplicate tool parameter"));
-            }
-            params = &params[value_end + "</parameter>".len()..];
-        }
-        // Schema mistakes are generated model output, not malformed API requests.
-        // Preserve them for the caller's tool execution and error feedback.
-        calls.push(json!({"id":format!("lia_call_{}",calls.len()),"type":"function","function":{"name":name,"arguments":serde_json::to_string(&args)?}}));
-        remainder = &remainder[end + "</tool_call>".len()..];
-    }
-    let content = text[..first_call.unwrap_or(text.len())].trim();
-    let mut message = json!({"role":"assistant","content":content,"reasoning_content":reasoning});
-    if !calls.is_empty() {
-        message["tool_calls"] = Json::Array(calls);
-    }
-    Ok(message)
 }
 
 #[cfg(test)]

@@ -23,6 +23,18 @@ pub(crate) mod device {
         }
     }
 
+    /// Preserve the part of an FP32 activation lost by a single FP16 operand.
+    #[kernel]
+    pub fn minicpm_f16_residual(input: &[f32], mut output: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(value) = output.get_mut(idx) {
+            let packed = cuda_device::convert::cvt_f16x2_f32(input[i], 0.0);
+            let (high, _) = cuda_device::convert::cvt_f32x2_f16x2(packed);
+            *value = input[i] - high;
+        }
+    }
+
     #[kernel]
     pub fn minicpm_position<const BF16: bool>(
         width: usize,

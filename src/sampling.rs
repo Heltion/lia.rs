@@ -1,9 +1,16 @@
 //! Seeded top-k/nucleus sampling and causal sample-and-match verification.
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 
 mod gumbel;
+#[cfg(any(feature = "cuda", test))]
+mod normal;
+mod nucleus;
+#[cfg(feature = "cuda")]
+pub(crate) use normal::gaussian;
+pub mod duplex;
 mod random;
 mod speculative;
+pub mod speech;
 
 pub struct Distribution {
     entries: Vec<(u32, f64)>,
@@ -28,7 +35,10 @@ impl Sampling {
             temperature.is_finite() && temperature > 0.0,
             "temperature must be finite and positive"
         );
-        ensure!((1..=20).contains(&top_k), "sampling top_k must be 1..=20");
+        ensure!(
+            top_k <= 20,
+            "sampling top_k must be 0 (unrestricted) or 1..=20"
+        );
         ensure!(
             top_p.is_finite() && top_p > 0.0 && top_p <= 1.0,
             "top_p must be in (0,1]"
@@ -82,20 +92,18 @@ impl Sampling {
         );
         candidates.retain(|(_, x)| *x != f32::NEG_INFINITY);
         let order = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0));
-        if candidates.len() > self.top_k {
+        if self.top_k != 0 && candidates.len() > self.top_k {
             candidates.select_nth_unstable_by(self.top_k, order);
+            candidates.truncate(self.top_k);
         }
-        candidates.truncate(self.top_k);
         candidates.sort_unstable_by(order);
         let max = candidates
             .first()
             .ok_or_else(|| anyhow!("empty sampling distribution"))?
             .1 as f64;
-        for (i, (id, _)) in candidates.iter().enumerate() {
-            ensure!(
-                !candidates[..i].iter().any(|(other, _)| other == id),
-                "duplicate sampling candidate"
-            );
+        let mut seen = std::collections::HashSet::with_capacity(candidates.len());
+        for (id, _) in &candidates {
+            ensure!(seen.insert(*id), "duplicate sampling candidate");
         }
         let mut entries: Vec<_> = candidates
             .into_iter()
@@ -180,6 +188,26 @@ impl Distribution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrestricted_nucleus_uses_the_full_vocabulary() -> Result<()> {
+        let full = Sampling::new(1.0, 0, 1.0, 42)?;
+        assert_eq!(
+            full.distribution((0..32).map(|id| (id, 0.0)))?
+                .entries
+                .len(),
+            32
+        );
+        let half = Sampling::new(1.0, 0, 0.5, 42)?;
+        assert_eq!(
+            half.distribution((0..32).map(|id| (id, 0.0)))?
+                .entries
+                .len(),
+            16
+        );
+        assert!(full.distribution([(7, 0.0), (7, 1.0)]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn temperature_top_k_and_nucleus() -> Result<()> {
