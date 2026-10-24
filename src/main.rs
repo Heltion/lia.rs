@@ -12,7 +12,7 @@ fn main() -> anyhow::Result<()> {
         );
         #[cfg(feature = "cuda")]
         println!(
-            "  serve MODEL [PORT] [CONTEXT] [--mmproj PROJECTOR]\n  forward MODEL TOKEN_IDS\n  forward-batch MODEL TOKEN_IDS\n  kernel-info"
+            "  serve MODEL [PORT] [CONTEXT] [--mmproj PROJECTOR]\n    MiniCPM5: --batch | --no-batch, --max-sequences N, --kv-pool-tokens N\n    --kv-host-mib N --kv-ssd-mib N --kv-cache-dir PATH\n  forward MODEL TOKEN_IDS\n  forward-batch MODEL TOKEN_IDS\n  kernel-info"
         );
         #[cfg(feature = "image-tools")]
         println!("  image-tools\n  read-image INPUT [OUTPUT.png] [--time SECONDS]");
@@ -86,15 +86,8 @@ fn main() -> anyhow::Result<()> {
         let path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
         let port = args.next().map(|s| s.parse()).transpose()?.unwrap_or(18474);
         let capacity = args.next().map(|s| s.parse()).transpose()?.unwrap_or(16384);
-        let projector = match args.next().as_deref() {
-            None => None,
-            Some("--mmproj") => Some(args.next().ok_or_else(|| anyhow!("missing mmproj path"))?),
-            Some(_) => return Err(anyhow!("expected --mmproj PATH after context capacity")),
-        };
-        if args.next().is_some() {
-            return Err(anyhow!("unexpected argument"));
-        }
-        return server::run_with_projector(&path, port, capacity, projector.as_deref());
+        let options = server::Options::parse(args)?;
+        return server::run_with_options(&path, port, capacity, options);
     }
     #[cfg(feature = "cuda")]
     if command.as_deref() == Some("forward") {

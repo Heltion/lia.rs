@@ -1,4 +1,6 @@
 //! Model identity and checkpoint contracts, separate from execution resources.
+mod minicpm5;
+pub mod minicpm_o45;
 pub mod minicpm_v47;
 mod quantization;
 pub(crate) mod qwen35;
@@ -12,6 +14,8 @@ use std::{fs::File, path::Path};
 pub enum Architecture {
     Qwen35Moe,
     MiniCpmV47,
+    MiniCpm5,
+    MiniCpmO45,
 }
 
 pub struct Checkpoint {
@@ -34,6 +38,12 @@ impl Checkpoint {
     }
 
     pub fn parse(config: Value) -> Result<Self> {
+        if config["model_type"] == "llama" {
+            return minicpm5::checkpoint(config);
+        }
+        if config["model_type"] == "minicpmo" {
+            return minicpm_o45::checkpoint(config);
+        }
         let architecture = match config["model_type"].as_str() {
             Some("qwen3_5_moe") => Architecture::Qwen35Moe,
             Some("minicpmv4_7") => Architecture::MiniCpmV47,
@@ -43,6 +53,8 @@ impl Checkpoint {
         let vocabulary = match architecture {
             Architecture::Qwen35Moe => 248320,
             Architecture::MiniCpmV47 => 248144,
+            Architecture::MiniCpm5 => 130560,
+            Architecture::MiniCpmO45 => unreachable!("MiniCPM-o has its own contract"),
         };
         qwen35::validate(text, vocabulary)?;
         let quantization = Quantization::parse(architecture, &config["quantization_config"])?;
@@ -91,12 +103,13 @@ impl Checkpoint {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) mod vision;
+pub(crate) mod parameters;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VisionEncoder {
     Qwen3Vl,
     MiniCpmV47,
+    MiniCpmO45,
 }
 
 #[cfg(feature = "cuda")]

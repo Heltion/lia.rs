@@ -7,10 +7,30 @@ use serde_json::Value;
 pub enum Quantization {
     Gsq,
     Int4,
+    Bf16,
+    Awq,
 }
 
 impl Quantization {
     pub(super) fn parse(architecture: Architecture, config: &Value) -> Result<Self> {
+        if architecture == Architecture::MiniCpmO45 {
+            ensure!(
+                config["quant_method"] == "awq"
+                    && config["bits"] == 4
+                    && config["group_size"] == 128
+                    && config["zero_point"] == true
+                    && config["version"] == "gemm",
+                "unsupported MiniCPM-o AWQ metadata"
+            );
+            return Ok(Self::Awq);
+        }
+        if architecture == Architecture::MiniCpm5 {
+            ensure!(
+                config.is_null(),
+                "MiniCPM5 BF16 cannot carry quantization metadata"
+            );
+            return Ok(Self::Bf16);
+        }
         ensure!(
             config["quant_method"] == "compressed-tensors" && config["format"] == "pack-quantized",
             "unsupported checkpoint quantization format"
@@ -22,6 +42,8 @@ impl Quantization {
                 ("group_2", 8, "channel"),
             ],
             Architecture::MiniCpmV47 => vec![("group_0", 4, "group")],
+            Architecture::MiniCpm5 => vec![],
+            Architecture::MiniCpmO45 => unreachable!("handled AWQ metadata"),
         };
         for (group, bits, strategy) in expected {
             let weights = &config["config_groups"][group]["weights"];
@@ -41,6 +63,8 @@ impl Quantization {
         Ok(match architecture {
             Architecture::Qwen35Moe => Self::Gsq,
             Architecture::MiniCpmV47 => Self::Int4,
+            Architecture::MiniCpm5 => Self::Bf16,
+            Architecture::MiniCpmO45 => Self::Awq,
         })
     }
 }

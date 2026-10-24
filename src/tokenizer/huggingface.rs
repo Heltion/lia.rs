@@ -14,7 +14,10 @@ impl Tokenizer {
             "unsupported Hugging Face tokenizer model or decoder"
         );
         for name in ["continuing_subword_prefix", "end_of_word_suffix"] {
-            ensure!(json["model"][name] == "", "unsupported tokenizer {name}");
+            ensure!(
+                json["model"][name].is_null() || json["model"][name] == "",
+                "unsupported tokenizer {name}"
+            );
         }
         for name in ["fuse_unk", "byte_fallback", "ignore_merges"] {
             ensure!(json["model"][name] == false, "unsupported tokenizer {name}");
@@ -22,21 +25,39 @@ impl Tokenizer {
         ensure!(
             (json["normalizer"].is_null() || json["normalizer"]["type"] == "NFC")
                 && json["model"]["dropout"].is_null()
-                && json["model"]["unk_token"].is_null(),
+                && (json["model"]["unk_token"].is_null() || json["model"]["unk_token"].is_string()),
             "unsupported BPE normalization or fallback"
         );
         let pre = &json["pre_tokenizer"]["pretokenizers"];
+        let pre = pre.as_array().context("missing pre-tokenizer sequence")?;
         ensure!(
-            json["pre_tokenizer"]["type"] == "Sequence"
-                && pre.as_array().is_some_and(|a| a.len() == 2)
-                && pre[0]["type"] == "Split"
-                && pre[0]["behavior"] == "Isolated"
-                && pre[0]["invert"] == false
-                && pre[1]["type"] == "ByteLevel"
-                && pre[1]["add_prefix_space"] == false
-                && pre[1]["use_regex"] == false,
-            "unsupported BPE pre-tokenizer"
+            json["pre_tokenizer"]["type"] == "Sequence" && pre.len() >= 2,
+            "unsupported BPE pre-tokenizer sequence"
         );
+        let byte = pre.last().context("missing byte-level pre-tokenizer")?;
+        ensure!(
+            byte["type"] == "ByteLevel"
+                && byte["add_prefix_space"] == false
+                && byte["use_regex"] == false,
+            "unsupported byte-level pre-tokenizer"
+        );
+        let mut patterns = Vec::new();
+        for split in &pre[..pre.len() - 1] {
+            ensure!(
+                split["type"] == "Split"
+                    && split["behavior"] == "Isolated"
+                    && split["invert"] == false,
+                "unsupported BPE split behavior"
+            );
+            patterns.push(
+                fancy_regex::Regex::new(
+                    split["pattern"]["Regex"]
+                        .as_str()
+                        .context("missing split expression")?,
+                )
+                .context("compiling checkpoint split expression")?,
+            );
+        }
         let vocab = json["model"]["vocab"]
             .as_object()
             .context("missing BPE vocabulary")?;
@@ -53,7 +74,11 @@ impl Tokenizer {
                 types.push(Value::Signed(1));
                 occupied.push(false);
             }
-            ensure!(!occupied[id], "duplicate tokenizer ID {id}");
+            ensure!(
+                !occupied[id]
+                    || matches!(&tokens[id], Value::String(existing) if existing == content),
+                "conflicting tokenizer ID {id}"
+            );
             occupied[id] = true;
             tokens[id] = Value::String(content.to_owned());
             types[id] = Value::Signed(kind);
@@ -68,12 +93,16 @@ impl Tokenizer {
         }
         let mut always = Vec::new();
         for token in added {
-            for name in ["single_word", "lstrip", "rstrip", "normalized"] {
+            for name in ["single_word", "lstrip", "rstrip"] {
                 ensure!(
                     token[name] == false,
                     "unsupported added-token behavior {name}"
                 );
             }
+            ensure!(
+                token["normalized"] == false || json["normalizer"].is_null(),
+                "unsupported normalized added token"
+            );
             let id = u32::try_from(token["id"].as_u64().context("missing added-token ID")?)?;
             let text = token["content"]
                 .as_str()
@@ -81,7 +110,8 @@ impl Tokenizer {
             // ASCII delimiters cannot compose with adjacent Unicode marks,
             // so normalizing around extraction preserves these added tokens.
             ensure!(
-                text.is_ascii() && text.starts_with('<') && text.ends_with('>'),
+                json["normalizer"].is_null()
+                    || (text.is_ascii() && text.starts_with('<') && text.ends_with('>')),
                 "unsupported added-token normalization boundary"
             );
             ensure!(!text.is_empty(), "empty added token");
@@ -101,11 +131,7 @@ impl Tokenizer {
             .map(merge)
             .collect::<Result<Vec<_>>>()?;
         let mut tokenizer = Self::from_arrays(&tokens, &types, &merges)?;
-        let pattern = pre[0]["pattern"]["Regex"]
-            .as_str()
-            .context("missing BPE splitting expression")?;
-        tokenizer.split = fancy_regex::Regex::new(pattern)
-            .context("compiling checkpoint BPE splitting expression")?;
+        tokenizer.split = patterns;
         always.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
         tokenizer.added = always;
         tokenizer.normalize_nfc = json["normalizer"]["type"] == "NFC";

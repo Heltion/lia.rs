@@ -108,6 +108,7 @@ pub(crate) unsafe fn launch_prefill_matrix(
     unsafe {
         match kind {
             0 => launch!(0, 4),
+            1 => launch!(1, 2),
             30 => launch!(30, 2),
             10 => launch!(10, 84),
             12 => launch!(12, 144),
@@ -150,6 +151,7 @@ mod tests {
             let mut reuse_input = false;
             for (kind, size) in [
                 (0, 4),
+                (1, 2),
                 (30, 2),
                 (10, 84),
                 (12, 144),
@@ -166,16 +168,22 @@ mod tests {
                 if batch == 2048 && kind != 17 {
                     continue;
                 }
-                let block_size = if kind == 0 || kind == 30 { 1 } else { 256 };
+                let block_size = if kind == 0 || kind == 1 || kind == 30 {
+                    1
+                } else {
+                    256
+                };
                 let mut weights: Vec<u8> = (0..rows * (cols / block_size) * size)
                     .map(|i| ((i * 73 + 19) % 256) as u8)
                     .collect();
-                if kind == 0 || kind == 30 {
+                if kind == 0 || kind == 1 || kind == 30 {
                     weights.clear();
                     for i in 0..rows * cols {
                         let value = ((i * 17 % 37) as f32 - 18.0) * 0.03;
                         if kind == 0 {
                             weights.extend_from_slice(&value.to_le_bytes());
+                        } else if kind == 1 {
+                            weights.extend_from_slice(&(value as f16).to_bits().to_le_bytes());
                         } else {
                             weights
                                 .extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());

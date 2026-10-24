@@ -7,6 +7,7 @@ pub(super) struct Prompt {
     pub sources: Vec<String>,
     pub images: Vec<(usize, PreparedImage)>,
     pub positions: Option<PositionPlan>,
+    pub audios: Vec<(usize, crate::models::minicpm_o45::audio::Features)>,
 }
 
 /// Match preprocessing to the actual reserved encoder working set.
@@ -52,14 +53,26 @@ fn image_sources(request: &Json) -> Result<Vec<String>> {
 
 impl Session {
     pub(super) fn prepare_prompt(&self, tokenizer: &Tokenizer, request: &Json) -> Result<Prompt> {
-        let sources = image_sources(request)?;
-        let text = crate::chat::render_template(&self.template, request)?;
+        let (sources, audio_sources, cache_sources) = if self.string_content {
+            let media = super::media::sources(request)?;
+            (media.images, media.audios, media.ordered)
+        } else {
+            let images = image_sources(request)?;
+            (images.clone(), Vec::new(), images)
+        };
+        let request = if self.string_content {
+            std::borrow::Cow::Owned(crate::chat::string_messages(request, "<|image_pad|>")?)
+        } else {
+            std::borrow::Cow::Borrowed(request)
+        };
+        let text = crate::chat::render_template(&self.template, &request)?;
         let tokens = tokenizer.encode(&text, true)?;
-        if sources.is_empty() {
+        if sources.is_empty() && audio_sources.is_empty() {
             return Ok(Prompt {
                 tokens,
-                sources,
+                sources: cache_sources,
                 images: Vec::new(),
+                audios: Vec::new(),
                 positions: None,
             });
         }
@@ -69,6 +82,23 @@ impl Session {
             .ok_or_else(|| anyhow!("image input requires a loaded vision model"))?;
         let processor = match processor {
             crate::models::image::Processor::Qwen(processor) => processor,
+            crate::models::image::Processor::MiniCpmO45 { max_slices } => {
+                let prepared = crate::models::minicpm_o45::prepare_media_prompt(
+                    tokenizer,
+                    tokens,
+                    &sources,
+                    &audio_sources,
+                    *max_slices,
+                    self.engine.capacity(),
+                )?;
+                return Ok(Prompt {
+                    tokens: prepared.tokens,
+                    sources: cache_sources,
+                    images: prepared.images,
+                    positions: Some(prepared.positions),
+                    audios: prepared.audios,
+                });
+            }
             crate::models::image::Processor::MiniCpmV47 { max_slices } => {
                 let prepared = crate::models::minicpm_v47::prepare_prompt(
                     tokenizer,
@@ -79,9 +109,10 @@ impl Session {
                 )?;
                 return Ok(Prompt {
                     tokens: prepared.tokens,
-                    sources,
+                    sources: cache_sources,
                     images: prepared.images,
                     positions: Some(prepared.positions),
+                    audios: Vec::new(),
                 });
             }
         };
@@ -112,9 +143,10 @@ impl Session {
         );
         Ok(Prompt {
             tokens: expanded,
-            sources,
+            sources: cache_sources,
             images,
             positions: Some(positions),
+            audios: Vec::new(),
         })
     }
 }

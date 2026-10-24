@@ -78,7 +78,53 @@ pub(crate) mod device {
                 let row = row_base + vec / 8;
                 let k = (vec % 8) * 8;
                 let dest = shared_index(vec / 8, k / 2);
-                if KIND == 0 || KIND == 30 {
+                if KIND == 1 {
+                    let packed = if row < rows {
+                        unsafe {
+                            weights
+                                .as_ptr()
+                                .add(((row * cols + col + k) * 2) as usize)
+                                .cast::<Words4>()
+                                .read()
+                        }
+                    } else {
+                        Words4 { data: [0; 4] }
+                    };
+                    unsafe {
+                        tile.add(dest).cast::<Words4>().write(packed);
+                    }
+                } else if KIND == 30 {
+                    let packed = if row < rows {
+                        // Full aligned eight-value BF16 groups, with no bytewise decode.
+                        unsafe {
+                            weights
+                                .as_ptr()
+                                .add(((row * cols + col + k) * 2) as usize)
+                                .cast::<Words4>()
+                                .read()
+                        }
+                    } else {
+                        Words4 { data: [0; 4] }
+                    };
+                    // A complete aligned vector store avoids four shared-memory instructions.
+                    let convert = |word: u32| {
+                        cuda_device::convert::cvt_f16x2_f32(
+                            f32::from_bits(word << 16),
+                            f32::from_bits(word & 0xffff_0000),
+                        )
+                    };
+                    let half = Words4 {
+                        data: [
+                            convert(packed.data[0]),
+                            convert(packed.data[1]),
+                            convert(packed.data[2]),
+                            convert(packed.data[3]),
+                        ],
+                    };
+                    unsafe {
+                        tile.add(dest).cast::<Words4>().write(half);
+                    }
+                } else if KIND == 0 {
                     let mut j = 0;
                     while j < 4 {
                         let (a, b) = if row < rows {

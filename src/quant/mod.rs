@@ -71,7 +71,7 @@ fn signed_byte(word: u64, lane: usize) -> f32 {
 pub fn decode_block(kind: u32, b: &[u8]) -> anyhow::Result<Vec<f32>> {
     let (count, bytes) = match kind {
         0 => (1, 4),
-        30 => (1, 2),
+        1 | 30 => (1, 2),
         10 => (256, 84),
         12 => (256, 144),
         14 => (256, 210),
@@ -94,6 +94,9 @@ pub fn decode_block(kind: u32, b: &[u8]) -> anyhow::Result<Vec<f32>> {
     if kind == 0 {
         return Ok(vec![f32::from_bits(u32_at(b, 0))]);
     }
+    if kind == 1 {
+        return Ok(vec![h(b, 0)]);
+    }
     if kind == 30 {
         return Ok(vec![f32::from_bits((u16_at(b, 0) as u32) << 16)]);
     }
@@ -109,6 +112,9 @@ pub fn decode_block(kind: u32, b: &[u8]) -> anyhow::Result<Vec<f32>> {
 pub fn decode_value(kind: u32, b: &[u8], i: usize) -> f32 {
     if kind == 0 {
         return f32::from_bits(u32_at(b, 0));
+    }
+    if kind == 1 {
+        return h(b, 0);
     }
     if kind == 30 {
         return f32::from_bits((u16_at(b, 0) as u32) << 16);
@@ -253,6 +259,7 @@ pub use packed::packed_eight;
 #[cfg(feature = "cuda")]
 pub use packed::packed_eight_aligned;
 
+pub mod awq;
 #[cfg(any(feature = "cuda", test))]
 pub(crate) mod fp8;
 pub mod gsq;

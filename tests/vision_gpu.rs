@@ -18,7 +18,7 @@ fn real_projector_encodes_selected_images() -> Result<()> {
     );
     let model = Model::open(&projector)?;
     let processor = Processor::from_model(&model, 256, 1024)?;
-    let engine = Engine::load_with_vision(&language, 32768, &projector)?;
+    let mut engine = Engine::load_with_vision(&language, 32768, &projector)?;
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(std::env::var("LIA_TEST_VISION_FIXTURES")?)?)?;
     for image in manifest["images"].as_array().unwrap() {

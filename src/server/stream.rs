@@ -32,6 +32,7 @@ pub(super) struct Output {
     model: String,
     created: u64,
     usage: bool,
+    multimodal: bool,
 }
 
 impl Output {
@@ -43,6 +44,9 @@ impl Output {
             model: request["model"].as_str().unwrap_or("lia.rs").to_owned(),
             created: unix_seconds(),
             usage: request["stream_options"]["include_usage"] == true,
+            multimodal: request["modalities"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|v| v == "audio")),
         };
         let events = futures_util::stream::unfold(receiver, |mut receiver| async {
             receiver.recv().await.map(|data| {
@@ -65,7 +69,11 @@ impl Output {
     }
 
     fn chunk(&self, choices: Json) -> Json {
-        json!({"id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,"choices":choices})
+        let mut chunk = json!({"id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,"choices":choices});
+        if self.multimodal {
+            chunk["modality"] = "text".into();
+        }
+        chunk
     }
 
     pub(super) fn is_closed(&self) -> bool {
@@ -76,9 +84,53 @@ impl Output {
         self.send(self.chunk(json!([{"index":0,"delta":delta,"finish_reason":null}])));
     }
 
+    pub(super) fn token(&self, token: u32) {
+        self.send(
+            self.chunk(json!([{"index":0,"delta":{},"finish_reason":null,"token_ids":[token]}])),
+        );
+    }
+
+    pub(super) fn audio_id(&self) -> String {
+        format!("audio-{}", self.id)
+    }
+
+    pub(super) fn audio(
+        &self,
+        bytes: &[u8],
+        format: &str,
+        sample_offset: usize,
+        code_n: usize,
+        last: bool,
+    ) -> Result<()> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let audio = json!({"id":self.audio_id(),"data":STANDARD.encode(bytes),"format":format,"sample_rate":24000,"sample_offset":sample_offset,"confirmed_code_n":code_n,"segment_final":last});
+        let mut chunk = self.chunk(json!([{"index":0,"delta":{"audio":audio,"content":audio["data"]},"finish_reason":null}]));
+        chunk["modality"] = "audio".into();
+        self.sender
+            .send(chunk.to_string())
+            .context("sending incremental audio")?;
+        Ok(())
+    }
+
     pub(super) fn finish(&self, response: &Result<Json>) {
         match response {
             Ok(response) => {
+                if let Some(audio) = response["choices"][0]["message"].get("audio") {
+                    let mut audio = audio.clone();
+                    if response["timings"]["speech"]["audio_delivery"] == "incremental" {
+                        if let Some(object) = audio.as_object_mut() {
+                            object.remove("data");
+                        }
+                    }
+                    let mut delta = json!({"audio":audio});
+                    if let Some(data) = audio.get("data") {
+                        delta["content"] = data.clone();
+                    }
+                    let mut chunk =
+                        self.chunk(json!([{"index":0,"delta":delta,"finish_reason":null}]));
+                    chunk["modality"] = "audio".into();
+                    self.send(chunk);
+                }
                 if let Some(calls) = response["choices"][0]["message"]["tool_calls"].as_array() {
                     for (index, call) in calls.iter().enumerate() {
                         let mut call = call.clone();
@@ -111,6 +163,15 @@ pub(super) struct Text {
 }
 
 impl Text {
+    pub(super) fn for_request(request: &Json) -> Self {
+        Self::with_thinking(crate::chat::thinking_enabled(request))
+    }
+    pub(super) fn with_thinking(thinking: bool) -> Self {
+        Self {
+            content: !thinking,
+            ..Self::default()
+        }
+    }
     pub(super) fn push(&mut self, bytes: &[u8], output: &Output) -> Result<()> {
         self.consume(bytes, false, |key, text| output.delta(json!({key:text})))
     }
@@ -226,6 +287,28 @@ impl Text {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_audio_finish_sends_transcript_without_replaying_samples() -> Result<()> {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let output = Output {
+            sender,
+            id: "test".into(),
+            model: "test".into(),
+            created: 0,
+            usage: true,
+            multimodal: true,
+        };
+        output.audio(&[1, 2], "pcm16", 0, 28, false)?;
+        output.finish(&Ok(json!({"choices":[{"message":{"audio":{"id":output.audio_id(),"data":"REPLAY","transcript":"hello"}},"finish_reason":"stop"}],"timings":{"speech":{"audio_delivery":"incremental"}}})));
+        let first: Json = serde_json::from_str(&receiver.try_recv()?)?;
+        assert_eq!(first["choices"][0]["delta"]["audio"]["data"], "AQI=");
+        let final_audio: Json = serde_json::from_str(&receiver.try_recv()?)?;
+        let delta = &final_audio["choices"][0]["delta"];
+        assert_eq!(delta["audio"]["transcript"], "hello");
+        assert!(delta["audio"].get("data").is_none() && delta.get("content").is_none());
+        Ok(())
+    }
 
     #[test]
     fn idle_stream_preserves_transport_without_semantic_events() -> Result<()> {

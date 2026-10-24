@@ -124,6 +124,30 @@ pub(crate) mod device {
     }
 
     #[kernel]
+    pub fn silu_joined(rows: usize, input: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(value) = out.get_mut(idx) {
+            let offset = i / rows * (2 * rows) + i % rows;
+            let gate = input[offset];
+            let up = input[offset + rows];
+            *value = up * gate / (1.0 + (-gate).exp());
+        }
+    }
+
+    #[kernel]
+    pub fn silu_interleaved(rows: usize, input: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(value) = out.get_mut(idx) {
+            let row = i % rows;
+            let offset = i / rows * (rows * 2) + row / 8 * 16 + row % 8;
+            let gate = input[offset];
+            *value = input[offset + 8] * gate / (1.0 + (-gate).exp());
+        }
+    }
+
+    #[kernel]
     pub fn silu_mul_in_place(gate: &[f32], mut values: DisjointSlice<f32>) {
         let idx = thread::index_1d();
         let i = idx.get();
@@ -190,6 +214,46 @@ mod tests {
                 expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
             );
             assert_eq!(original.to_host_vec(&stream)?, input);
+        }
+        Ok(())
+    }
+    #[test]
+    fn joined_gateup_activation_matches_independent_inputs() -> Result<()> {
+        let context = CudaContext::new(0)?;
+        let stream = context.default_stream();
+        let module = crate::gpu::kernels::load(&context)?;
+        for (rows, batch) in [(1usize, 1usize), (31, 3), (257, 17), (12288, 34)] {
+            let n = rows * batch;
+            let up: Vec<f32> = (0..n).map(|i| (i % 113) as f32 * 0.25 - 13.0).collect();
+            let gate: Vec<f32> = (0..n).map(|i| (i % 503) as f32 - 251.0).collect();
+            let mut joined = Vec::with_capacity(n * 2);
+            for token in 0..batch {
+                joined.extend_from_slice(&gate[token * rows..(token + 1) * rows]);
+                joined.extend_from_slice(&up[token * rows..(token + 1) * rows]);
+            }
+            let input = DeviceBuffer::from_host(&stream, &joined)?;
+            let du = DeviceBuffer::from_host(&stream, &up)?;
+            let dg = DeviceBuffer::from_host(&stream, &gate)?;
+            let mut actual = DeviceBuffer::zeroed(&stream, n)?;
+            let mut expected = DeviceBuffer::zeroed(&stream, n)?;
+            let config = LaunchConfig::for_num_elems(n as u32);
+            // SAFETY: complete gate/up pairs per token; guarded exact outputs.
+            unsafe {
+                module
+                    .basic
+                    .silu_joined(&stream, config, rows, &input, &mut actual)?;
+                module
+                    .basic
+                    .silu_mul(&stream, config, &du, &dg, &mut expected)?;
+            }
+            assert!(
+                actual
+                    .to_host_vec(&stream)?
+                    .iter()
+                    .zip(expected.to_host_vec(&stream)?)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "joined activation rows={rows} batch={batch}"
+            );
         }
         Ok(())
     }

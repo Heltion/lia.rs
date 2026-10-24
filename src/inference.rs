@@ -1,4 +1,4 @@
-//! Single-sequence Qwen 3.5 forward execution using independently written kernels.
+//! Model execution and cache ownership for independently written Rust GPU operators.
 use crate::{
     gguf::{Model, Value},
     gpu::kernels,
@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, simt::LaunchConfig};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -16,7 +16,15 @@ use std::{
 };
 mod allocation;
 mod attention_plan;
+mod audio;
 mod buffer;
+pub mod duplex;
+mod embeddings;
+use embeddings::Span;
+mod codec;
+pub use audio::AudioCache;
+pub use codec::stream::{CodecEncoderCache, CodecFlowCache, CodecHiftCache, CodecVoiceStream};
+mod components;
 mod geometry;
 mod graph;
 mod gsq;
@@ -25,6 +33,9 @@ mod huggingface;
 mod initialize;
 mod moe;
 mod penalty;
+mod s3;
+mod speaker;
+pub mod speech;
 use buffer::Buffer;
 use geometry::Geometry;
 struct RotaryWork {
@@ -83,10 +94,11 @@ pub struct Snapshot {
     recurrent: Vec<Option<(DeviceBuffer<f32>, DeviceBuffer<f32>)>>,
     hidden: Option<DeviceBuffer<f32>>,
     positions: Option<crate::vision::PositionPlan>,
-    images: Vec<Rc<vision::ImageEmbedding>>,
+    embeddings: Vec<Rc<embeddings::Span>>,
 }
 pub struct Engine {
     geometry: Geometry,
+    awq_weights: BTreeMap<String, crate::gpu::awq::Weights>,
     experts: BTreeMap<usize, crate::gpu::moe::Experts>,
     routing: Option<RoutingWork>,
     presence: Option<DeviceBuffer<f32>>,
@@ -98,10 +110,18 @@ pub struct Engine {
     host_weight_bytes: usize,
     states: Vec<State>,
     position: usize,
+    paging: Option<paging::Work>,
+    kv_batch_copy: Cell<bool>,
+    paged_replays: RefCell<BTreeMap<(usize, usize, usize), graph::paged::Replay>>,
     capacity: usize,
     eps: f32,
     rope_base: f32,
     pool: Rc<RefCell<BTreeMap<usize, Vec<DeviceBuffer<f32>>>>>,
+    cache_pool: Rc<RefCell<BTreeMap<usize, Vec<DeviceBuffer<f32>>>>>,
+    decode_pool: Rc<RefCell<BTreeMap<usize, Vec<DeviceBuffer<f32>>>>>,
+    decode_pool_active: Rc<Cell<bool>>,
+    qwen3_decode_replay: RefCell<Option<graph::qwen3::Replay>>,
+    qwen3_replay_enabled: bool,
     last_hidden: Option<Buffer>,
     mtp_prepared: Option<(usize, u32)>,
     profile: bool,
@@ -116,6 +136,19 @@ pub struct Engine {
     gdn_prepared: Option<DeviceBuffer<u32>>,
     greedy_work: BTreeMap<usize, DeviceBuffer<u32>>,
     integer: bool,
+    bf16_vector: bool,
+    llama_flash: bool,
+    llama_flash_wide: bool,
+    llama_fusion: bool,
+    qwen3_prepare_fusion: bool,
+    qwen3_tensor_pv: bool,
+    qwen3_register_p: bool,
+    qwen3_vector_norm: bool,
+    llama_gated: bool,
+    llama_weight_cache: BTreeMap<String, DeviceBuffer<u8>>,
+    llama_full_prefill_span: bool,
+    llama_flash_decode: bool,
+    nucleus: RefCell<Option<crate::gpu::nucleus::Workspace>>,
     split_k: usize,
     row_group: usize,
     matrix_threads: usize,
@@ -141,7 +174,7 @@ pub struct Engine {
     vision_encoder: crate::models::VisionEncoder,
     host_vision: BTreeMap<String, vision::offload::HostWeight>,
     kv_offloaded: bool,
-    images: Vec<Rc<vision::ImageEmbedding>>,
+    embeddings: Vec<Rc<embeddings::Span>>,
 }
 fn config_u64(model: &Model, key: &str) -> Result<u64> {
     match model.metadata.get(key) {
@@ -222,7 +255,23 @@ mod operations;
 mod positions;
 mod prefill;
 mod projections;
+mod qwen3;
+mod qwen3_ffn;
+mod qwen3_prepare;
 mod recurrent;
 mod sampling;
 mod speculation;
 mod vision;
+
+mod llama;
+mod llama_fusion;
+mod llama_matrix;
+mod llama_plan;
+mod llama_weights;
+pub(crate) mod page_cache;
+mod paged_sampling;
+mod paging;
+mod paging_transfer;
+mod paging_upload;
+pub use paging::PagedRow;
+pub use paging_transfer::MINICPM5_PAGE_BYTES;

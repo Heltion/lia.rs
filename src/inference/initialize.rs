@@ -21,17 +21,41 @@ impl Engine {
         };
         let mut states = Vec::new();
         for layer in 0..geometry.layers + usize::from(geometry.mtp) {
-            states.push(if layer == geometry.layers || (layer + 1) % 4 == 0 {
-                State::Attention {
-                    k: DeviceBuffer::zeroed(&stream, capacity * geometry.kv_heads * 256)?,
-                    v: DeviceBuffer::zeroed(&stream, capacity * geometry.kv_heads * 256)?,
-                }
-            } else {
-                State::Recurrent {
-                    conv: DeviceBuffer::zeroed(&stream, 3 * geometry.recurrent_width())?,
-                    matrix: DeviceBuffer::zeroed(&stream, geometry.value_heads * 128 * 128)?,
-                }
-            });
+            states.push(
+                if geometry.llama
+                    || geometry.qwen3
+                    || layer == geometry.layers
+                    || (layer + 1) % 4 == 0
+                {
+                    State::Attention {
+                        k: DeviceBuffer::zeroed(
+                            &stream,
+                            capacity
+                                * geometry.kv_heads
+                                * if geometry.llama || geometry.qwen3 {
+                                    128
+                                } else {
+                                    256
+                                },
+                        )?,
+                        v: DeviceBuffer::zeroed(
+                            &stream,
+                            capacity
+                                * geometry.kv_heads
+                                * if geometry.llama || geometry.qwen3 {
+                                    128
+                                } else {
+                                    256
+                                },
+                        )?,
+                    }
+                } else {
+                    State::Recurrent {
+                        conv: DeviceBuffer::zeroed(&stream, 3 * geometry.recurrent_width())?,
+                        matrix: DeviceBuffer::zeroed(&stream, geometry.value_heads * 128 * 128)?,
+                    }
+                },
+            );
         }
         stream.synchronize()?;
         let rotary = RefCell::new(RotaryWork {
@@ -44,6 +68,7 @@ impl Engine {
         let zero_hidden = DeviceBuffer::zeroed(&stream, geometry.hidden)?;
         let mut engine = Self {
             geometry,
+            awq_weights: BTreeMap::new(),
             experts: BTreeMap::new(),
             routing: if geometry.moe {
                 Some(RoutingWork {
@@ -78,14 +103,32 @@ impl Engine {
             host_weight_bytes: 0,
             states,
             position: 0,
+            paging: None,
+            kv_batch_copy: Cell::new(std::env::var("LIA_KV_BATCH_COPY").as_deref() != Ok("0")),
+            paged_replays: RefCell::new(BTreeMap::new()),
             capacity,
             eps,
             rope_base,
             pool: Rc::new(RefCell::new(BTreeMap::new())),
+            cache_pool: Rc::new(RefCell::new(BTreeMap::new())),
             last_hidden: None,
             mtp_prepared: None,
             profile: std::env::var_os("LIA_PROFILE").is_some(),
             integer: std::env::var("LIA_INT8").as_deref().unwrap_or("1") != "0",
+            bf16_vector: std::env::var("LIA_BF16_VECTOR").as_deref() != Ok("0"),
+            llama_flash: std::env::var("LIA_LLAMA_FLASH").as_deref() != Ok("0"),
+            llama_flash_wide: std::env::var("LIA_LLAMA_FLASH_WIDE").as_deref() == Ok("1"),
+            qwen3_vector_norm: std::env::var("LIA_QWEN3_VECTOR_NORM").as_deref() == Ok("1"),
+            qwen3_register_p: std::env::var("LIA_QWEN3_REGISTER_P").as_deref() == Ok("1"),
+            qwen3_tensor_pv: std::env::var("LIA_QWEN3_TENSOR_PV").as_deref() == Ok("1"),
+            qwen3_prepare_fusion: std::env::var("LIA_QWEN3_PREPARE_FUSION").as_deref() == Ok("1"),
+            llama_fusion: std::env::var("LIA_LLAMA_FUSION").as_deref() != Ok("0"),
+            llama_gated: std::env::var("LIA_LLAMA_GATED").as_deref() != Ok("0"),
+            llama_weight_cache: BTreeMap::new(),
+            llama_full_prefill_span: std::env::var("LIA_LLAMA_FULL_PREFILL_SPAN").as_deref()
+                == Ok("1"),
+            llama_flash_decode: std::env::var("LIA_LLAMA_FLASH_DECODE").as_deref() != Ok("0"),
+            nucleus: RefCell::new(None),
             split_k: std::env::var("LIA_SPLIT_K")
                 .unwrap_or_else(|_| "1".into())
                 .parse::<usize>()
@@ -108,8 +151,12 @@ impl Engine {
                 .unwrap_or_else(|_| "128".into())
                 .parse::<usize>()
                 .ok()
-                .filter(|n| [128, 256].contains(n))
-                .ok_or_else(|| anyhow!("LIA_ATTN_DECODE_SPAN must be 128 or 256"))?,
+                .filter(|n| [128, 256].contains(n) || (geometry.qwen3 && [32, 64].contains(n)))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "LIA_ATTN_DECODE_SPAN must be 128 or 256 (Qwen3 also supports 32 and 64)"
+                    )
+                })?,
             attention_merge_shared: std::env::var("LIA_ATTN_MERGE_SHARED").as_deref() == Ok("1"),
             parallel_convolution: std::env::var("LIA_CONV_PARALLEL").as_deref() == Ok("1"),
             attention_mma_decode: std::env::var("LIA_ATTN_MMA_DECODE")
@@ -144,6 +191,10 @@ impl Engine {
             preallocated: cuda_graph || std::env::var("LIA_PREALLOCATE").as_deref() == Ok("1"),
             cuda_graph,
             decode_replay: RefCell::new(None),
+            decode_pool: Rc::new(RefCell::new(BTreeMap::new())),
+            decode_pool_active: Rc::new(Cell::new(false)),
+            qwen3_decode_replay: RefCell::new(None),
+            qwen3_replay_enabled: std::env::var("LIA_QWEN3_DECODE_REPLAY").as_deref() == Ok("1"),
             graphs: RefCell::new(BTreeMap::new()),
             graph_stats: RefCell::new([0; 3]),
             scratch_reserved: 0,
@@ -175,7 +226,7 @@ impl Engine {
             vision_encoder: crate::models::VisionEncoder::Qwen3Vl,
             host_vision,
             kv_offloaded: false,
-            images: Vec::new(),
+            embeddings: Vec::new(),
         };
         engine.geometry.mtp &= engine.max_draft > 0;
         if !engine.geometry.mtp {

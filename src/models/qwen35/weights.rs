@@ -50,6 +50,8 @@ impl Mapping {
         let storage = match self.architecture {
             Architecture::Qwen35Moe => Storage::Grouped { bits, group },
             Architecture::MiniCpmV47 => Storage::Dense,
+            Architecture::MiniCpm5 => unreachable!("MiniCPM5 uses its own weight plan"),
+            Architecture::MiniCpmO45 => unreachable!("MiniCPM-o uses its own weight plan"),
         };
         let source = match storage {
             Storage::Dense => format!("{source}.weight"),

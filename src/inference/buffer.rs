@@ -1,9 +1,11 @@
 //! Owned allocation leases retain their physical capacity while exposing a logical slice.
 use super::*;
+use anyhow::Context;
 
 pub(super) struct Buffer {
     data: Option<DeviceBuffer<f32>>,
     capacity: usize,
+    recycle_limit: usize,
     pool: Rc<RefCell<BTreeMap<usize, Vec<DeviceBuffer<f32>>>>>,
 }
 
@@ -29,12 +31,35 @@ impl Buffer {
         Ok(Self {
             data: Some(data),
             capacity,
+            recycle_limit: usize::MAX,
             pool,
         })
     }
 }
 
 impl Engine {
+    /// Request-owned streaming histories must not pin the language graph's
+    /// bounded scratch leases. Recycle exact extents under a separate byte cap.
+    pub(super) fn cache_buffer(&self, elements: usize) -> Result<Buffer> {
+        if !self.preallocated {
+            return self.zeros(elements);
+        }
+        anyhow::ensure!(elements > 0, "empty request cache allocation");
+        let recycled = self
+            .cache_pool
+            .borrow_mut()
+            .get_mut(&elements)
+            .and_then(|buffers| buffers.pop());
+        let data = match recycled {
+            Some(data) => data,
+            None => DeviceBuffer::zeroed(&self.stream, elements)
+                .with_context(|| format!("allocating {elements} request cache elements"))?,
+        };
+        let mut output = Buffer::lease(data, elements, self.cache_pool.clone())?;
+        output.recycle_limit = 64 * 1024 * 1024;
+        Ok(output)
+    }
+
     pub(super) fn activate_owned(
         &self,
         mut values: Buffer,
@@ -78,11 +103,17 @@ impl Drop for Buffer {
                 // back to the full allocation; no interior pointers are constructed.
                 unsafe { DeviceBuffer::from_raw_parts(pointer, self.capacity, context) }
             };
-            self.pool
-                .borrow_mut()
-                .entry(self.capacity)
-                .or_default()
-                .push(data);
+            let mut pool = self.pool.borrow_mut();
+            if self.recycle_limit != usize::MAX {
+                let retained = pool
+                    .iter()
+                    .map(|(n, buffers)| n * buffers.len() * 4)
+                    .sum::<usize>();
+                if retained.saturating_add(self.capacity * 4) > self.recycle_limit {
+                    return;
+                }
+            }
+            pool.entry(self.capacity).or_default().push(data);
         }
     }
 }

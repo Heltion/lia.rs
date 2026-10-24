@@ -53,6 +53,9 @@ impl Engine {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+    pub fn position(&self) -> usize {
+        self.position
+    }
 
     pub fn stochastic_mtp(&self) -> bool {
         self.stochastic_mtp
@@ -75,9 +78,19 @@ impl Engine {
         }
     }
     pub fn integer_enabled(&self) -> bool {
-        self.integer && !self.geometry.moe
+        self.integer && !self.geometry.moe && !self.geometry.llama && !self.geometry.qwen3
     }
     pub fn prefill_precision(&self) -> &'static str {
+        if self.geometry.qwen3 {
+            return self
+                .awq_weights
+                .values()
+                .next()
+                .map_or("unavailable", |weights| weights.prefill_precision());
+        }
+        if self.geometry.llama {
+            return "bf16_weights_f16_tensor_f32_accumulation";
+        }
         if self.geometry.moe {
             if self
                 .experts
@@ -102,6 +115,14 @@ impl Engine {
             .ok_or_else(|| anyhow!("no target hidden state"))?;
         let logits = self.mm("output.weight", hidden)?;
         Ok(self.greedy(&logits)?[0])
+    }
+    /// Read the post-normalization row of the most recently forwarded token.
+    pub fn current_hidden_state(&self) -> Result<Vec<f32>> {
+        self.last_hidden
+            .as_ref()
+            .context("no target hidden state")?
+            .to_host_vec(&self.stream)
+            .context("reading target hidden state from GPU")
     }
     /// Read raw next-token scores without advancing or modifying cached state.
     pub fn current_logits(&self) -> Result<Vec<f32>> {
@@ -139,7 +160,7 @@ impl Engine {
         }
         saved.position = self.position;
         saved.positions = self.rotary.borrow().plan.clone();
-        saved.images = self.images.clone();
+        saved.embeddings = self.embeddings.clone();
         self.stream.synchronize()?;
         Ok(())
     }
@@ -161,10 +182,11 @@ impl Engine {
             recurrent,
             hidden,
             positions: self.rotary.borrow().plan.clone(),
-            images: self.images.clone(),
+            embeddings: self.embeddings.clone(),
         })
     }
     pub fn restore(&mut self, snapshot: &Snapshot) -> Result<()> {
+        self.qwen3_decode_replay.borrow_mut().take();
         for (state, saved) in self.states.iter_mut().zip(&snapshot.recurrent) {
             if let (State::Recurrent { conv, matrix }, Some((sc, sm))) = (state, saved) {
                 conv.copy_from_device_async(sc, &self.stream)?;
@@ -181,12 +203,13 @@ impl Engine {
         };
         self.position = snapshot.position;
         self.upload_position_plan(snapshot.positions.clone())?;
-        self.images = snapshot.images.clone();
+        self.embeddings = snapshot.embeddings.clone();
         self.mtp_prepared = None;
         self.stream.synchronize()?;
         Ok(())
     }
     pub fn reset(&mut self) -> Result<()> {
+        self.qwen3_decode_replay.borrow_mut().take();
         self.decode_replay.borrow_mut().take();
         self.stream.synchronize()?;
         for state in &mut self.states {
@@ -201,7 +224,7 @@ impl Engine {
         self.position = 0;
         self.rotary.borrow_mut().key = None;
         self.rotary.borrow_mut().plan = None;
-        self.images.clear();
+        self.embeddings.clear();
         self.verify_hidden = None;
         self.capture = false;
         self.last_hidden = None;

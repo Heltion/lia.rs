@@ -51,7 +51,7 @@ fn native_vision_matches_official_transformer_features() -> Result<()> {
     let reference = std::path::PathBuf::from(std::env::var("LIA_TEST_VISION_REFERENCE")?);
     let processor = lia::vision::Processor::from_huggingface(&path, 256, 1024)?;
     let image = processor.prepare(&std::fs::read(reference.join("vision-reference.png"))?)?;
-    let engine = Engine::load_huggingface(&path, 64, true)?;
+    let mut engine = Engine::load_huggingface(&path, 64, true)?;
     let actual = engine.image_embeddings(&image)?;
     let bytes = std::fs::read(reference.join("vision-reference.f32"))?;
     anyhow::ensure!(bytes.len().is_multiple_of(4), "invalid F32 reference");

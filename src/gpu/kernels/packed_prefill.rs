@@ -7,6 +7,12 @@ use cuda_host::cuda_module;
 pub(crate) mod device {
     use super::*;
 
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    struct Words {
+        data: [u32; 4],
+    }
+
     #[inline(always)]
     fn pair(word: u32, shift: u32, scale: f32, offset: f32) -> u32 {
         let a = ((word >> shift) as u8 as i8 as f32) * scale + offset;
@@ -47,7 +53,22 @@ pub(crate) mod device {
                 let row = row_base + vec / 8;
                 let k = (vec % 8) * 8;
                 let dest = ((vec / 8) * 36 + k / 2) as usize;
-                if KIND == 0 || KIND == 30 {
+                if KIND == 1 {
+                    let packed = if row < rows {
+                        unsafe {
+                            weights
+                                .as_ptr()
+                                .add(((row * cols + col + k) * 2) as usize)
+                                .cast::<Words>()
+                                .read()
+                        }
+                    } else {
+                        Words { data: [0; 4] }
+                    };
+                    unsafe {
+                        tile.add(dest).cast::<Words>().write(packed);
+                    }
+                } else if KIND == 0 || KIND == 30 {
                     let mut j = 0;
                     while j < 4 {
                         let (a, b) = if row < rows {
